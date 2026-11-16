@@ -861,8 +861,11 @@ O.prototype.inlineTokens = function (src, tokens = []) {
       return fastInlineTokens(this, src, src, tokens);
     }
     // Emphasis present: build maskedSrc exactly as #n would, push the
-    // closer-scan cache exactly as #e does, run the #t loop.
-    const masked = HAS_MASK_CHARS.test(src) ? maskSrcOriginal(this, src) : src;
+    // closer-scan cache exactly as #e does, run the #t loop. The mask
+    // is skipped when maskNeeded() proves no delimiter sits inside a
+    // masked span or is escaped (then maskedSrc === src behaves
+    // identically for emStrong/del -- see step 4 note above).
+    const masked = HAS_MASK_CHARS.test(src) && maskNeeded(src) ? maskSrcOriginal(this, src) : src;
     Ae(this.tokenizer, masked);
     try {
       return fastInlineTokens(this, src, masked, tokens);
@@ -983,6 +986,167 @@ function fastInlineTokens(lexer, src, maskedSrc, tokens) {
     if (e) { lexer.infiniteLoopError(e.charCodeAt(0)); break; }
   }
   return n;
+}
+
+// ---------------------------------------------------------------------------
+// v6 step 4: skip the emphasis mask when it cannot change anything.
+// maskSrcOriginal hides `*`/`_`/`~` delimiters that sit inside a code
+// span, a link span (label, url or title), an html span, or a backslash
+// escape, so the emphasis scanner does not treat them as delimiters.
+// When no delimiter sits inside such a span (and none is escaped),
+// the masked string behaves exactly like the original for emStrong/del:
+//   - delimiter runs themselves are only `*`/`_`/`~`, never span chars,
+//     so a delimiter outside a span sees the same neighbours;
+//   - a span's edge chars are punctuation in both forms (link '['/']'
+//     vs ')' , code '`' vs '`', html '<'/'>' vs ']', escape '\x' vs
+//     '++'), so the flanking class of an adjacent delimiter, the
+//     punctuation/alphanumeric tests in emStrong, and the closer-scan
+//     cache (fe) are all unchanged;
+//   - all three replaces preserve string length, so indices align.
+// maskNeeded() is conservative: any doubt returns true (run the mask).
+// It scans the run once with indexOf jumps (no regex), tracking code
+// spans (closing run must equal the opening run, as in the regex),
+// link spans (bracket-depth counting with escape + code-span skips,
+// then the (...) url or [...] ref part), html spans ('<' to next '>'),
+// and escapes. Delimiters are checked with native indexOf inside each
+// protected region.
+// ---------------------------------------------------------------------------
+
+// True when src[a..b) holds '*', '_' or '~'.
+function hasDelim(src, a, b) {
+  let p = src.indexOf('*', a);
+  if (p !== -1 && p < b) return true;
+  p = src.indexOf('_', a);
+  if (p !== -1 && p < b) return true;
+  p = src.indexOf('~', a);
+  return p !== -1 && p < b;
+}
+
+// End index (exclusive) of the code span starting at the backtick run
+// at `pos`, or -1 when the run is bare (no closing run of equal length).
+// Mirrors the code-span alternative of the mask regexes
+// (`^(`+)([^`]|[^`][\s\S]*?[^`])\1(?!`)`): the content may contain
+// backtick runs SHORTER than the opening run (the lazy middle grows
+// past them), and the closing run is the FIRST run whose length EQUALS
+// the opening run. A run LONGER than the opening run can never close:
+// `\1` there would be followed by a backtick ((?!`) fails) or, at its
+// tail, preceded by a backtick (the trailing [^`] of the content fails).
+// So runs of any other length are skipped as content.
+function codeSpanEnd(src, pos) {
+  const n = src.length;
+  let j = pos;
+  while (j < n && src.charCodeAt(j) === 96) j++;
+  const open = j - pos;
+  let k = j;
+  for (;;) {
+    k = src.indexOf('`', k);
+    if (k < 0) return -1;
+    let m = k;
+    while (m < n && src.charCodeAt(m) === 96) m++;
+    if (m - k === open) return m;
+    k = m; // run of other length: part of the content, keep scanning
+  }
+}
+
+// End index (exclusive) of the link span starting at the '[' at `pos`,
+// or -1 when there is no link span (label never closes). The protected
+// region covers the label plus, when present, the (...) url part (to
+// its matching ')') or the [...] ref part. Bracket depth is counted
+// with backslash escapes and code spans skipped, mirroring the label
+// pattern of the mask regexes. Over-approximates: a label is protected
+// even when its ref is not a defined link (the mask would then be a
+// no-op for it, so protecting it only costs speed, never correctness).
+function linkSpanEnd(src, pos) {
+  const n = src.length;
+  let depth = 0;
+  let i = pos;
+  while (i < n) {
+    const c = src.charCodeAt(i);
+    if (c === 92) { i += 2; continue; } // escape: skip next char
+    if (c === 96) {
+      const end = codeSpanEnd(src, i);
+      if (end < 0) { i++; continue; }
+      i = end;
+      continue;
+    }
+    if (c === 91) { depth++; i++; continue; }
+    if (c === 93) {
+      depth--;
+      i++;
+      if (depth === 0) {
+        // label closed at i; extend over (...) url or [...] ref part
+        if (i < n && src.charCodeAt(i) === 40) {
+          let d = 0;
+          let j = i;
+          while (j < n) {
+            const cc = src.charCodeAt(j);
+            if (cc === 92) { j += 2; continue; }
+            if (cc === 40) d++;
+            else if (cc === 41) { d--; if (d === 0) return j + 1; }
+            j++;
+          }
+          return i; // unbalanced parens: protect the label alone
+        }
+        if (i < n && src.charCodeAt(i) === 91) {
+          // ref part: reuse the label scan from here
+          const refEnd = linkSpanEnd(src, i);
+          return refEnd < 0 ? i : refEnd;
+        }
+        return i; // nolink [...]: protect the label alone
+      }
+      continue;
+    }
+    i++;
+  }
+  return -1;
+}
+
+// True when the emphasis mask could change emStrong/del behaviour for
+// this run: some delimiter sits inside a masked span or is escaped.
+function maskNeeded(src) {
+  const n = src.length;
+  let i = 0;
+  while (i < n) {
+    // Next span-start char among \ ` [ < (native indexOf jumps).
+    let next = -1;
+    for (const ch of '\\`[<') {
+      const p = src.indexOf(ch, i);
+      if (p !== -1 && (next === -1 || p < next)) next = p;
+    }
+    if (next === -1) return false;
+    i = next;
+    const c = src.charCodeAt(i);
+    if (c === 92) { // backslash escape
+      const d = src.charCodeAt(i + 1);
+      if (d === 42 || d === 95 || d === 126) return true;
+      i += 2;
+      continue;
+    }
+    if (c === 96) { // code span
+      const end = codeSpanEnd(src, i);
+      if (end < 0) {
+        // Bare run: skip the whole run (the mask's bare `+ leaves it).
+        while (i < n && src.charCodeAt(i) === 96) i++;
+        continue;
+      }
+      if (hasDelim(src, i, end)) return true;
+      i = end;
+      continue;
+    }
+    if (c === 60) { // '<' html span: to the next '>'
+      const gt = src.indexOf('>', i + 1);
+      if (gt < 0) { i++; continue; }
+      if (hasDelim(src, i + 1, gt)) return true;
+      i = gt + 1;
+      continue;
+    }
+    // '[' link span
+    const end = linkSpanEnd(src, i);
+    if (end < 0) { i++; continue; }
+    if (hasDelim(src, i, end)) return true;
+    i = end;
+  }
+  return false;
 }
 
 // ---------------------------------------------------------------------------
