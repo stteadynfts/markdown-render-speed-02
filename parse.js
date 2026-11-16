@@ -433,11 +433,14 @@ const _emStrongOriginal = _.prototype.emStrong;
 _.prototype.emStrong = function (src, maskedSrc, prevChar) {
   const c = src.charCodeAt(0);
   if (c !== 42 && c !== 95) return undefined;
-  // v6 step 8: fast path for single/double '*' emphasis with plain
-  // neighbours (see emStrongFast below). Anything else, including all
-  // '_' emphasis, falls through to the original.
+  // v6 step 8/9: fast paths for single/double '*' (emStrongFast) and
+  // '_' (emUndFast) emphasis with plain neighbours. Anything else
+  // falls through to the original.
   if (c === 42) {
     const fast = emStrongFast(this, src, maskedSrc, prevChar);
+    if (fast) return fast;
+  } else if (c === 95) {
+    const fast = emUndFast(this, src, maskedSrc, prevChar);
     if (fast) return fast;
   }
   return _emStrongOriginal.call(this, src, maskedSrc, prevChar);
@@ -527,6 +530,72 @@ function emStrongFast(tok, e, maskedSrc, prevChar) {
   const after = mClose + k < maskedSrc.length ? maskedSrc.charCodeAt(mClose + k) : -1;
   if (after !== -1 && after >= 128) return null;
   if (isAsciiPunct(before) && after !== -1 && !isAsciiSpace(after) && !isAsciiPunct(after)) return null;
+  const raw = e.slice(0, cpos + k);
+  const text = e.slice(k, cpos);
+  return {
+    type: k === 1 ? 'em' : 'strong',
+    raw,
+    text,
+    tokens: tok.lexer.inlineTokens(text),
+  };
+}
+
+// Fast path for '_' emphasis: '_text_' (em) / '__text__' (strong).
+// Mirrors emStrongFast, plus the '_' flanking rules (CommonMark):
+// an '_' delimiter can open iff it is left-flanking AND (not
+// right-flanking OR preceded by punctuation), and can close iff it
+// is right-flanking AND (not left-flanking OR followed by
+// punctuation). A first '_' after the opener that is not a valid
+// closer makes the fast path bail (the original keeps searching for
+// a later one), which is always safe. Bail if the content holds '**'
+// (the original's closer regex has a skip alternative for
+// '**..._...**' regions). All non-ASCII neighbours bail.
+function emUndFast(tok, e, maskedSrc, prevChar) {
+  const n = e.length;
+  if (n <= 2) return null;
+  let k = 1;
+  if (e.charCodeAt(1) === 95) {
+    if (e.charCodeAt(2) === 95) return null; // run >= 3: bail
+    k = 2;
+  }
+  if (n <= k + 1) return null; // need opener + content + closer
+  const f = e.charCodeAt(k);
+  if (f >= 128 || isAsciiSpace(f)) return null;
+  const pos = maskedSrc.length - e.length;
+  const prev = pos > 0 ? maskedSrc.charCodeAt(pos - 1) : -1;
+  if (prev === 42 || prev === 95) return null; // o/R flag: bail
+  if (prev >= 128) return null;
+  if (isAsciiPunct(f) && prevChar !== ''
+    && !isAsciiSpace(prev) && !isAsciiPunct(prev)) return null; // d/n/u gate
+  // Opener flanking (start of string counts as whitespace).
+  const prevIsSpace = prev === -1 || isAsciiSpace(prev);
+  const prevIsPunct = prev !== -1 && isAsciiPunct(prev);
+  const fIsPunct = isAsciiPunct(f);
+  const lfOp = !fIsPunct || prevIsSpace || prevIsPunct;
+  const rfOp = !prevIsSpace && (!prevIsPunct || fIsPunct);
+  if (!lfOp || (rfOp && !prevIsPunct)) return null; // cannot open
+  // Closer: first later '_' run of exactly length k in the MASKED
+  // string (indices align with the original).
+  const mClose = maskedSrc.indexOf('_', pos + k);
+  if (mClose < 0) return null;
+  const cpos = mClose - pos;
+  if (cpos === k) return null; // empty content
+  for (let j = 0; j < k; j++) {
+    if (maskedSrc.charCodeAt(mClose + j) !== 95) return null;
+  }
+  if (maskedSrc.charCodeAt(mClose + k) === 95) return null; // longer run: bail
+  if (maskedSrc.indexOf('**', pos + k) < mClose) return null; // '**' in content
+  // Closer flanking (end of string counts as whitespace).
+  const before = maskedSrc.charCodeAt(mClose - 1);
+  if (before >= 128 || isAsciiSpace(before)) return null;
+  const after = mClose + k < maskedSrc.length ? maskedSrc.charCodeAt(mClose + k) : -1;
+  if (after !== -1 && after >= 128) return null;
+  const afterIsSpace = after === -1 || isAsciiSpace(after);
+  const afterIsPunct = after !== -1 && isAsciiPunct(after);
+  const beforeIsPunct = isAsciiPunct(before);
+  const lfCl = !afterIsSpace && (!afterIsPunct || beforeIsPunct);
+  const rfCl = !beforeIsPunct || afterIsSpace || afterIsPunct;
+  if (!rfCl || (lfCl && !afterIsPunct)) return null; // cannot close
   const raw = e.slice(0, cpos + k);
   const text = e.slice(k, cpos);
   return {
