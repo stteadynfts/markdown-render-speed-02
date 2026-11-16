@@ -433,14 +433,17 @@ const _emStrongOriginal = _.prototype.emStrong;
 _.prototype.emStrong = function (src, maskedSrc, prevChar) {
   const c = src.charCodeAt(0);
   if (c !== 42 && c !== 95) return undefined;
-  // v6 step 8/9: fast paths for single/double '*' (emStrongFast) and
-  // '_' (emUndFast) emphasis with plain neighbours. Anything else
-  // falls through to the original.
+  // v6 step 8/9/11: fast paths for single/double '*' (emStrongFast) and
+  // '_' (emUndFast) emphasis with plain neighbours. A fast path returns
+  // false when it proves there is no token (skip the original regex);
+  // null means fall back to the original. Anything else falls through.
   if (c === 42) {
     const fast = emStrongFast(this, src, maskedSrc, prevChar);
+    if (fast === false) return undefined;
     if (fast) return fast;
   } else if (c === 95) {
     const fast = emUndFast(this, src, maskedSrc, prevChar);
+    if (fast === false) return undefined;
     if (fast) return fast;
   }
   return _emStrongOriginal.call(this, src, maskedSrc, prevChar);
@@ -455,6 +458,17 @@ function isAsciiSpace(c) {
 function isAsciiPunct(c) {
   return (c >= 33 && c <= 47) || (c >= 58 && c <= 64) ||
     (c >= 91 && c <= 96) || (c >= 123 && c <= 126);
+}
+// ASCII punctuation as the emphasis/del regexes' `punct` group sees it
+// in the GFM rules: [\p{P}\p{S}] EXCLUDING '~' (the group is
+// /(?!~)[\p{P}\p{S}]/). '~' (126, Sm) is NOT punct there -- it is a
+// word char for '*' (notPunctSpace `it` includes '~') but punct for
+// '_'/'~' (whose `punct` is $ = [\p{P}\p{S}] with '~'). Using the
+// broad set for `d` wrongly claims "no token" for f='~' (v4 returns
+// em for 'a*~~a*b~~.').
+function isAsciiPunctNoTilde(c) {
+  return (c >= 33 && c <= 47) || (c >= 58 && c <= 64) ||
+    (c >= 91 && c <= 96) || (c >= 123 && c <= 125);
 }
 
 // Fast path for `*text*` (em) and `**text**` (strong): the opener run
@@ -489,8 +503,9 @@ function emStrongFast(tok, e, maskedSrc, prevChar) {
   // Char after the opener: ASCII, not whitespace (else LDelim has no
   // following-char group and the original returns nothing).
   const f = e.charCodeAt(k);
-  if (f >= 128 || isAsciiSpace(f)) return null;
-  const d = isAsciiPunct(f); // opener followed by punctuation
+  if (isAsciiSpace(f)) return false; // definitely no token
+  if (f >= 128) return null;
+  const d = isAsciiPunctNoTilde(f); // opener followed by punctuation (ye)
   // Char before the opener in the masked run: ASCII (or start of run),
   // and not '*'/'_' (else the preceding delimiter run is non-empty).
   const pos = maskedSrc.length - e.length;
@@ -506,7 +521,7 @@ function emStrongFast(tok, e, maskedSrc, prevChar) {
   // exists, and it is neither punctuation nor whitespace.
   if (d && prevChar !== '') {
     const u = isAsciiSpace(prev) || isAsciiPunct(prev);
-    if (!u) return null;
+    if (!u) return false; // definitely no token
   }
   // Closer: first later '*' run of exactly length k in the MASKED
   // string (a '*' inside a code/link/html span is hidden there, so
@@ -514,22 +529,25 @@ function emStrongFast(tok, e, maskedSrc, prevChar) {
   // the original (the mask preserves length), so raw/text are sliced
   // from e at the same positions.
   const mClose = maskedSrc.indexOf('*', pos + k);
-  if (mClose < 0) return null;
+  if (mClose < 0) return false; // no closer run: definitely no token
   const cpos = mClose - pos; // closer index within e
   if (cpos === k) return null; // empty content
   for (let j = 0; j < k; j++) {
     if (maskedSrc.charCodeAt(mClose + j) !== 42) return null;
   }
   if (maskedSrc.charCodeAt(mClose + k) === 42) return null; // longer run: bail
-  // Closer must be right-flanking (checked on the masked string, as
-  // the original's closer scan does): not preceded by whitespace, and
-  // (not preceded by punctuation, or followed by whitespace /
-  // punctuation / end of string).
+  // Closer validity (GFM ht groups): a closer preceded by a word char
+  // or '~' (notPunctSpace `it`) is always valid; one preceded by
+  // punctuation (ye) needs the next char to be whitespace, end of
+  // string, or punctuation (ye); one preceded by whitespace is never
+  // valid. (The old broad-punct check wrongly accepted a closer
+  // preceded by punctuation and followed by '~': '*a!*~'.)
   const before = maskedSrc.charCodeAt(mClose - 1);
   if (before >= 128 || isAsciiSpace(before)) return null;
   const after = mClose + k < maskedSrc.length ? maskedSrc.charCodeAt(mClose + k) : -1;
   if (after !== -1 && after >= 128) return null;
-  if (isAsciiPunct(before) && after !== -1 && !isAsciiSpace(after) && !isAsciiPunct(after)) return null;
+  if (isAsciiPunctNoTilde(before)
+    && after !== -1 && !isAsciiSpace(after) && !isAsciiPunctNoTilde(after)) return null;
   const raw = e.slice(0, cpos + k);
   const text = e.slice(k, cpos);
   return {
@@ -560,24 +578,29 @@ function emUndFast(tok, e, maskedSrc, prevChar) {
   }
   if (n <= k + 1) return null; // need opener + content + closer
   const f = e.charCodeAt(k);
-  if (f >= 128 || isAsciiSpace(f)) return null;
+  if (isAsciiSpace(f)) return false; // definitely no token
+  if (f >= 128) return null;
   const pos = maskedSrc.length - e.length;
   const prev = pos > 0 ? maskedSrc.charCodeAt(pos - 1) : -1;
   if (prev === 42 || prev === 95) return null; // o/R flag: bail
   if (prev >= 128) return null;
-  if (isAsciiPunct(f) && prevChar !== ''
-    && !isAsciiSpace(prev) && !isAsciiPunct(prev)) return null; // d/n/u gate
-  // Opener flanking (start of string counts as whitespace).
+  if (isAsciiPunctNoTilde(f) && prevChar !== ''
+    && !isAsciiSpace(prev) && !isAsciiPunct(prev)) return false; // d/n/u gate
+  // Opener flanking (start of string counts as whitespace). When the
+  // opener cannot open, the original finds no token either -- but the
+  // opener rule is subtle (it is enforced by the gate plus the closer
+  // search, not by a single check), so bail to the original instead
+  // of claiming "no token" here.
   const prevIsSpace = prev === -1 || isAsciiSpace(prev);
   const prevIsPunct = prev !== -1 && isAsciiPunct(prev);
   const fIsPunct = isAsciiPunct(f);
   const lfOp = !fIsPunct || prevIsSpace || prevIsPunct;
   const rfOp = !prevIsSpace && (!prevIsPunct || fIsPunct);
-  if (!lfOp || (rfOp && !prevIsPunct)) return null; // cannot open
+  if (!lfOp || (rfOp && !prevIsPunct)) return null; // cannot open: bail
   // Closer: first later '_' run of exactly length k in the MASKED
   // string (indices align with the original).
   const mClose = maskedSrc.indexOf('_', pos + k);
-  if (mClose < 0) return null;
+  if (mClose < 0) return false; // no closer run: definitely no token
   const cpos = mClose - pos;
   if (cpos === k) return null; // empty content
   for (let j = 0; j < k; j++) {
@@ -630,10 +653,10 @@ function delFast(tok, e, maskedSrc, prevChar) {
   if (n <= k + 1) return null;
   const f = e.charCodeAt(k);
   if (f >= 128 || isAsciiSpace(f)) return null;
-  if (isAsciiPunct(f) && prevChar !== '' && !isAsciiPunct(prevChar)) return null;
+  if (isAsciiPunctNoTilde(f) && prevChar !== '' && !isAsciiPunct(prevChar)) return false; // gate
   const pos = maskedSrc.length - e.length;
   const mClose = maskedSrc.indexOf('~~', pos + k);
-  if (mClose < 0) return null;
+  if (mClose < 0) return false; // no closer run: definitely no token
   const cpos = mClose - pos;
   if (cpos === k) return null; // empty content
   for (let j = 0; j < k; j++) {
@@ -669,8 +692,10 @@ _.prototype.br = function (src) {
 const _delOriginal = _.prototype.del;
 _.prototype.del = function (src, maskedSrc, prevChar) {
   if (src.charCodeAt(0) !== 126) return undefined;
-  // v6 step 10: fast path for '~~text~~' / '~text~' (see delFast).
+  // v6 step 10/11: fast path for '~~text~~' (see delFast). false means
+  // proven no token (skip the original regex); null means fall back.
   const fast = delFast(this, src, maskedSrc, prevChar);
+  if (fast === false) return undefined;
   if (fast) return fast;
   return _delOriginal.call(this, src, maskedSrc, prevChar);
 };
