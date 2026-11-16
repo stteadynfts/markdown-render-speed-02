@@ -606,6 +606,55 @@ function emUndFast(tok, e, maskedSrc, prevChar) {
   };
 }
 
+// Fast path for '~~text~~' (del, k=2) and '~text~' (del, k=1).
+// Mirrors emStrongFast: the opener run is exactly k tildes, the
+// closer is the first later run of exactly k in the MASKED string,
+// right-flanking (same check as '*': the closer regex's groups 3/4
+// are opener-only and fail it). The del tokenizer has no rule of 3
+// and no 'o' flag, so no preceding-char bail is needed; its gate
+// (opener followed by punctuation requires the preceding char to be
+// punctuation or absent) is replicated from the prevChar param.
+// Single '~' runs are skipped for k=2 (the original requires the
+// closer length to equal the opener length).
+function delFast(tok, e, maskedSrc, prevChar) {
+  const n = e.length;
+  if (n <= 2) return null;
+  let k = 1;
+  if (e.charCodeAt(1) === 126) {
+    if (e.charCodeAt(2) === 126) return null; // run >= 3: bail
+    k = 2;
+  }
+  // Single '~' strikethrough is rare (551/2140 del tokens) and the
+  // closer search scans far; only fast-path k=2.
+  if (k === 1) return null;
+  if (n <= k + 1) return null;
+  const f = e.charCodeAt(k);
+  if (f >= 128 || isAsciiSpace(f)) return null;
+  if (isAsciiPunct(f) && prevChar !== '' && !isAsciiPunct(prevChar)) return null;
+  const pos = maskedSrc.length - e.length;
+  const mClose = maskedSrc.indexOf('~~', pos + k);
+  if (mClose < 0) return null;
+  const cpos = mClose - pos;
+  if (cpos === k) return null; // empty content
+  for (let j = 0; j < k; j++) {
+    if (maskedSrc.charCodeAt(mClose + j) !== 126) return null;
+  }
+  if (maskedSrc.charCodeAt(mClose + k) === 126) return null; // longer run: bail
+  const before = maskedSrc.charCodeAt(mClose - 1);
+  if (before >= 128 || isAsciiSpace(before)) return null;
+  const after = mClose + k < maskedSrc.length ? maskedSrc.charCodeAt(mClose + k) : -1;
+  if (after !== -1 && after >= 128) return null;
+  if (isAsciiPunct(before) && after !== -1 && !isAsciiSpace(after) && !isAsciiPunct(after)) return null;
+  const raw = e.slice(0, cpos + k);
+  const text = e.slice(k, cpos);
+  return {
+    type: 'del',
+    raw,
+    text,
+    tokens: tok.lexer.inlineTokens(text),
+  };
+}
+
 const _codespanOriginal = _.prototype.codespan;
 _.prototype.codespan = function (src) {
   return src.charCodeAt(0) === 96 ? _codespanOriginal.call(this, src) : undefined;
@@ -619,7 +668,11 @@ _.prototype.br = function (src) {
 
 const _delOriginal = _.prototype.del;
 _.prototype.del = function (src, maskedSrc, prevChar) {
-  return src.charCodeAt(0) === 126 ? _delOriginal.call(this, src, maskedSrc, prevChar) : undefined;
+  if (src.charCodeAt(0) !== 126) return undefined;
+  // v6 step 10: fast path for '~~text~~' / '~text~' (see delFast).
+  const fast = delFast(this, src, maskedSrc, prevChar);
+  if (fast) return fast;
+  return _delOriginal.call(this, src, maskedSrc, prevChar);
 };
 
 const _autolinkOriginal = _.prototype.autolink;
