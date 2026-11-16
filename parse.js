@@ -971,3 +971,178 @@ function fastInlineTokens(lexer, src, maskedSrc, tokens) {
   }
   return n;
 }
+
+// ---------------------------------------------------------------------------
+// v6 step 2: manual paragraph scan. The GFM paragraph regex
+// /^([^\n]+(?:\n(?!hr|heading|blockquote|fences|list|html|table|[ \t]+\n)[^\n]+)*)/
+// (normal mode: same minus the table alternative) re-runs its per-line
+// negative lookahead over every continuation line. The scan below walks
+// lines with indexOf and tests each line with char checks that are
+// exactly the regex's alternatives:
+//   - blank line (empty, or spaces/tabs only followed by \n) stops;
+//     a spaces-only line at EOF is INCLUDED (the lookahead needs \n).
+//   - hr: <=3 spaces, 3+ of one of - _ * with spaces/tabs between.
+//   - heading: <=3 spaces, 1-6 #, then whitespace or EOL.
+//   - blockquote: <=3 spaces then '>'.
+//   - fences: <=3 spaces, 3+ backticks with no further backtick on the
+//     line, or 3+ tildes.
+//   - list: <=3 spaces, *+- or "1."/"1)", then spaces/tabs, then a
+//     non-space/tab char on the line.
+//   - html: '<' after <=3 spaces -> the paragraph's html pattern is
+//     tested on the remaining source (rare; the regex decides).
+//   - table (GFM only): the line plus the NEXT line form a table
+//     header+delimiter; gated by a necessary-condition char pre-check
+//     on the next line, then the table regex itself decides.
+// Differentially verified vs v4 on the 720 practice cases + fuzz.
+// ---------------------------------------------------------------------------
+
+// Paragraph's html lookahead pattern (same source as the GFM paragraph
+// regex's html alternative; K is marked's block-tag list).
+const PARA_HTML_RE = new RegExp(`^ {0,3}(?:</?(?:${K})(?: +|\n|/?>)|<(?:(?:script|pre|style|textarea)(?:[\\s>]|$)|!--)|<\\?|<![A-Za-z]|<!\\[CDATA\\[)`);
+
+// Necessary condition for the next line to be a GFM table delimiter:
+// <=3 leading spaces, only space | : - chars, at least one '-'.
+function tableDelimPrecheck(src, pos, eol) {
+  let i = pos;
+  let sp = 0;
+  while (i < eol && src.charCodeAt(i) === 32 && sp < 3) { i++; sp++; }
+  if (i < eol && src.charCodeAt(i) === 32) return false;
+  let hasDash = false;
+  for (; i < eol; i++) {
+    const c = src.charCodeAt(i);
+    if (c === 45) hasDash = true;
+    else if (c !== 124 && c !== 58 && c !== 32) return false;
+  }
+  return hasDash;
+}
+
+// Does the line at [pos, eol) start a block that ends a paragraph?
+// `nextEol` is the end of the FOLLOWING line (-1 when there is none).
+function lineStartsBlock(src, pos, eol, nextPos, nextEol, checkTable) {
+  let i = pos;
+  let sp = 0;
+  while (i < eol && src.charCodeAt(i) === 32 && sp < 3) { i++; sp++; }
+  if (i >= eol) return false;
+  if (src.charCodeAt(i) === 32) {
+    // >3 leading spaces: no hr/heading/blockquote/fences/list/html
+    // start, but the line can still be a table header (header allows
+    // any indent), so fall through to the table check below.
+  } else {
+    const c = src.charCodeAt(i);
+    if (c === 62) return true; // >
+    if (c === 35) { // # heading: 1-6 #, then whitespace or EOL
+      let j = i;
+      let cnt = 0;
+      while (j < eol && src.charCodeAt(j) === 35 && cnt < 7) { j++; cnt++; }
+      if (cnt <= 6) {
+        if (j >= eol) return true;
+        const c2 = src.charAt(j);
+        if (c2 === ' ' || c2 === '\t' || /\s/.test(c2)) return true;
+      }
+      // 7+ #'s or non-space after #'s: not a heading; may be a table header
+    } else if (c === 96 || c === 126) { // ` or ~ fences
+      let j = i;
+      while (j < eol && src.charCodeAt(j) === c) j++;
+      if (j - i >= 3) {
+        if (c === 126) return true;
+        let more = false;
+        for (let k = j; k < eol; k++) if (src.charCodeAt(k) === 96) { more = true; break; }
+        if (!more) return true;
+      }
+    } else if (c === 45 || c === 95 || c === 42) { // - _ * : hr, else list
+      let j = i;
+      let count = 0;
+      while (j < eol) {
+        const cc = src.charCodeAt(j);
+        if (cc === c) { count++; j++; }
+        else if (cc === 32 || cc === 9) j++;
+        else break;
+      }
+      if (count >= 3 && j >= eol) return true;
+      if (c === 42 || c === 45) { // * - list bullet
+        const after = i + 1 < eol ? src.charCodeAt(i + 1) : -1;
+        if (after === 32 || after === 9) {
+          let k = i + 1;
+          while (k < eol && (src.charCodeAt(k) === 32 || src.charCodeAt(k) === 9)) k++;
+          if (k < eol) return true;
+        }
+      }
+    } else if (c === 43) { // + list bullet
+      const after = i + 1 < eol ? src.charCodeAt(i + 1) : -1;
+      if (after === 32 || after === 9) {
+        let k = i + 1;
+        while (k < eol && (src.charCodeAt(k) === 32 || src.charCodeAt(k) === 9)) k++;
+        if (k < eol) return true;
+      }
+    } else if (c === 49) { // '1' ordered list bullet "1." / "1)"
+      const d = i + 1 < eol ? src.charCodeAt(i + 1) : -1;
+      if (d === 46 || d === 41) {
+        const after = i + 2 < eol ? src.charCodeAt(i + 2) : -1;
+        if (after === 32 || after === 9) {
+          let k = i + 2;
+          while (k < eol && (src.charCodeAt(k) === 32 || src.charCodeAt(k) === 9)) k++;
+          if (k < eol) return true;
+        }
+      }
+    } else if (c === 60) { // < html: let the regex decide (rare)
+      if (PARA_HTML_RE.test(src.slice(pos))) return true;
+    }
+  }
+  if (checkTable && nextPos >= 0 && nextEol > nextPos) {
+    // A table starts here iff this line + the next line match the table
+    // regex; the pre-check is necessary for the delimiter line.
+    if (tableDelimPrecheck(src, nextPos, nextEol)) return xe.test(src.slice(pos));
+  }
+  return false;
+}
+
+// End index (exclusive) of the paragraph starting at src[0], i.e. the
+// same extent the GFM/normal paragraph regex would match. Returns -1
+// when the regex could not match at all (first line empty).
+function paragraphExtent(src, checkTable) {
+  const n = src.length;
+  if (n === 0 || src.charCodeAt(0) === 10) return -1;
+  let nl = src.indexOf('\n');
+  if (nl < 0) return n;
+  let end = nl;
+  let pos = nl + 1;
+  while (pos <= n) {
+    let eol = src.indexOf('\n', pos);
+    if (eol < 0) eol = n;
+    // blank line? empty, or spaces/tabs only followed by \n
+    let blank = pos >= eol;
+    if (!blank) {
+      let allSpace = true;
+      for (let i = pos; i < eol; i++) {
+        const cc = src.charCodeAt(i);
+        if (cc !== 32 && cc !== 9) { allSpace = false; break; }
+      }
+      blank = allSpace && eol < n;
+    }
+    if (blank) break;
+    let nextPos = -1, nextEol = -1;
+    if (eol < n) {
+      nextPos = eol + 1;
+      nextEol = src.indexOf('\n', nextPos);
+      if (nextEol < 0) nextEol = n;
+    }
+    if (lineStartsBlock(src, pos, eol, nextPos, nextEol, checkTable)) break;
+    end = eol;
+    if (eol >= n) break;
+    pos = eol + 1;
+  }
+  return end;
+}
+
+const _paragraphOriginal = _.prototype.paragraph;
+_.prototype.paragraph = function (src) {
+  // Pedantic uses a different paragraph regex; custom startBlock
+  // extensions can truncate the input. Both fall back to the original.
+  if (this.options.pedantic || this.options.extensions?.startBlock) {
+    return _paragraphOriginal.call(this, src);
+  }
+  const end = paragraphExtent(src, this.options.gfm);
+  if (end < 0) return undefined;
+  const text = src.slice(0, end);
+  return { type: 'paragraph', raw: text, text, tokens: this.lexer.inline(text) };
+};
