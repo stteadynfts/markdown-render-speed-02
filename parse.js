@@ -261,7 +261,7 @@ const reInlineText = build(/^(?:[^a-zA-Z0-9](?=emailProtocol)|(`+|~+|[^`~])(?:(?
 // The one sweep that finds where a plain-text run must end: the next
 // character that can start an inline token, a www/scheme/email autolink, or
 // the two spaces of a hard break. Anything else is consumed in one go.
-const reNextSpecial = /[`*_~\[\\<!]|www\.|[a-zA-Z][a-zA-Z0-9+.-]{1,31}:\/\/|[A-Za-z0-9.!#$%&'*+\/=?^_`{|}~-]+@[A-Za-z0-9]| {2,}\n/g;
+const reNextSpecial = /[`*_~\[\\<!]|(?<![^\s*_~(])www\.|(?<![A-Za-z0-9])(?:mailto|xmpp):|(?:[hH][tT][tT][pP][sS]?|[fF][tT][pP]):\/\/|[A-Za-z0-9.!#$%&'*+\/=?^_`{|}~-]+@| {2,}\n/g;
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -401,6 +401,14 @@ function isAlnumChar(ch) {
   const code = ch.charCodeAt(0);
   return (code >= 48 && code <= 57) || (code >= 65 && code <= 90) || (code >= 97 && code <= 122);
 }
+// A URL (extended autolink) can start with an email local-part character:
+// a letter or digit, or '.', '_', '+' or '-'. The `www.` / scheme /
+// `mailto:` cases all start with a letter, so this one gate covers them.
+function isUrlStartChar(ch) {
+  if (!ch) return false;
+  if (isAlnumChar(ch)) return true;
+  return ch === '.' || ch === '_' || ch === '+' || ch === '-';
+}
 
 // ---------------------------------------------------------------------------
 // Emphasis mask: hides delimiters inside links, code spans, HTML and
@@ -440,15 +448,22 @@ function maskSrc(ctx, src) {
     };
     out = out.replace(reReflinkSearch, maskReflink);
   }
-  out = out.replace(reAnyPunctOutsideCode, (m0, code, punct) => {
-    if (punct) return '+'.repeat(m0.length);
-    if (code) return code + m0.slice(code.length, -code.length).replace(/`/g, '+') + code;
-    return m0;
-  });
-  out = out.replace(reBlockSkip, (m0, _link, context) => {
-    const off = context ? context.length : 0;
-    return m0.slice(0, off) + '[' + 'a'.repeat(m0.length - off - 2) + ']';
-  });
+  // The escape/code-span pass can only match where a backtick or a
+  // backslash occurs; the link/code/html pass only where '[', '`' or '<'
+  // occurs. Skip the full scan when the character cannot be there.
+  if (src.includes('`') || src.includes('\\')) {
+    out = out.replace(reAnyPunctOutsideCode, (m0, code, punct) => {
+      if (punct) return '+'.repeat(m0.length);
+      if (code) return code + m0.slice(code.length, -code.length).replace(/`/g, '+') + code;
+      return m0;
+    });
+  }
+  if (src.includes('[') || src.includes('`') || src.includes('<')) {
+    out = out.replace(reBlockSkip, (m0, _link, context) => {
+      const off = context ? context.length : 0;
+      return m0.slice(0, off) + '[' + 'a'.repeat(m0.length - off - 2) + ']';
+    });
+  }
   return out;
 }
 function ensureMask(ctx, run) {
@@ -839,7 +854,7 @@ function tokenizeInline(ctx, run, src, tokens) {
       continue;
     }
     // Extended autolink, only outside links and only where one can start.
-    if (!ctx.inLink && isAlnumChar(ch)) {
+    if (!ctx.inLink && isUrlStartChar(ch)) {
       tok = tokUrl(src, pos);
       if (tok) {
         pos += tok.raw.length;
@@ -1011,8 +1026,15 @@ function tokList(ctx, src) {
   let cap = reList.exec(src);
   if (!cap) return undefined;
   const listSrc = src;
-  let s = src;
-  const taken = () => listSrc.length - s.length;
+  // Index cursor: the old code re-sliced the remaining string per line,
+  // which copies the whole remainder every line. Lines are read by index;
+  // only the per-item regexes still see a slice (once per item).
+  let p = 0;
+  const taken = () => p;
+  const lineAt = () => {
+    const nl = listSrc.indexOf('\n', p);
+    return nl === -1 ? listSrc.slice(p) : listSrc.slice(p, nl);
+  };
   let bull = cap[1].trim();
   const isordered = bull.length > 1;
   const list = {
@@ -1026,17 +1048,17 @@ function tokList(ctx, src) {
   bull = isordered ? `\\d{1,9}\\${bull.slice(-1)}` : `\\${bull}`;
   const itemRegex = listItemRe(bull);
   let endsWithBlankLine = false;
-  while (s) {
+  while (p < listSrc.length) {
     let endEarly = false;
     let itemContents = '';
-    if (!(cap = itemRegex.exec(s))) break;
-    if (reHr.test(s)) break; // End list if bullet was actually HR
+    if (!(cap = itemRegex.exec(listSrc.slice(p)))) break;
+    if (reHr.test(listSrc.slice(p))) break; // End list if bullet was actually HR
     const itemStart = taken();
-    s = s.substring(cap[0].length);
+    p += cap[0].length;
     const firstLine = cap[2].split('\n', 1)[0];
     const bulletIndent = cap[1].length;
     let line = firstLine.replace(reLeadingSpaceTab, (ws) => expandTabs(ws, bulletIndent));
-    let nextLine = s.split('\n', 1)[0];
+    let nextLine = lineAt();
     let blankLine = !line.trim();
     let indent = 0;
     if (blankLine) {
@@ -1048,7 +1070,7 @@ function tokList(ctx, src) {
       indent += bulletIndent;
     }
     if (blankLine && reBlankLine.test(nextLine)) {
-      s = s.substring(nextLine.length + 1);
+      p += nextLine.length + 1;
       endEarly = true;
     }
     if (!endEarly) {
@@ -1058,17 +1080,27 @@ function tokList(ctx, src) {
       const headingBeginRegex = headingBeginRe(indent);
       const htmlBeginRegex = htmlBeginRe(indent);
       const blockquoteBeginRegex = blockquoteBeginRe(indent);
-      while (s) {
-        const rawLine = s.split('\n', 1)[0];
-        let nextLineWithoutTabs;
+      while (p < listSrc.length) {
+        const rawLine = lineAt();
         nextLine = rawLine;
-        nextLineWithoutTabs = nextLine.replace(reLeadingSpaceTab, (ws) => expandTabs(ws));
-        if (fencesBeginRegex.test(nextLine)) break;
-        if (headingBeginRegex.test(nextLine)) break;
-        if (htmlBeginRegex.test(nextLine)) break;
-        if (blockquoteBeginRegex.test(nextLine)) break;
-        if (nextBulletRegex.test(nextLine)) break;
-        if (hrRegex.test(nextLine)) break;
+        // First-character gate: each interrupt rule can only match when
+        // the line's first non-space character (within the indent
+        // allowance) starts it. Plain continuation lines skip all six
+        // regexes this way.
+        let k = 0;
+        while (k < indent && rawLine.charCodeAt(k) === 32) k++;
+        const fc = rawLine[k];
+        if (fc === '`' || fc === '~') { if (fencesBeginRegex.test(nextLine)) break; }
+        else if (fc === '#') { if (headingBeginRegex.test(nextLine)) break; }
+        else if (fc === '<') { if (htmlBeginRegex.test(nextLine)) break; }
+        else if (fc === '>') { if (blockquoteBeginRegex.test(nextLine)) break; }
+        else if (fc === '*' || fc === '+' || fc === '-' || (fc >= '0' && fc <= '9')) {
+          if (nextBulletRegex.test(nextLine)) break;
+          if (hrRegex.test(nextLine)) break;
+        } else if (fc === '_') {
+          if (hrRegex.test(nextLine)) break;
+        }
+        const nextLineWithoutTabs = nextLine.replace(reLeadingSpaceTab, (ws) => expandTabs(ws));
         if (nextLineWithoutTabs.search(reNonSpace) >= indent || !nextLine.trim()) {
           itemContents += '\n' + nextLineWithoutTabs.slice(indent);
         } else {
@@ -1088,7 +1120,7 @@ function tokList(ctx, src) {
           itemContents += '\n' + continuation;
         }
         blankLine = !nextLine.trim();
-        s = s.substring(rawLine.length + 1);
+        p += rawLine.length + 1;
         line = nextLineWithoutTabs.slice(indent);
       }
     }
