@@ -113,6 +113,14 @@ function isWordCode(c) {
 // the text before it as one text token, exactly as the inline text rule
 // would. Returns null when the run cannot be taken safely, and the caller
 // falls back to the original rule.
+//
+// NOTE: a trigger at position 0 MUST return null (not skip ahead). The
+// text rule stops at every trigger character, so after a tokenizer fails
+// at position 0 the loop must retry the tokenizers at the next trigger
+// position one by one (e.g. in `____`, emStrong has to be tried on each
+// `_`: the 4th can open because it is preceded by punctuation). Skipping
+// the leading trigger and consuming a whole run as text breaks that retry
+// and changes emphasis/code-span parsing (fuzz: 195/4000 mismatches).
 function fastTextRun(src, inRawBlock) {
   if (src.length === 0) return null;
   TEXT_TRIGGER.lastIndex = 0;
@@ -125,9 +133,12 @@ function fastTextRun(src, inRawBlock) {
   }
   if (stop === 0) return null;
   const seg = stop < 0 ? src : src.slice(0, stop);
-  // Same set as TEXT_FALLBACK, as plain substring checks: String.includes
-  // is a memmem scan and far cheaper than the alternation regex per segment.
-  if (seg.includes('@') || seg.includes('://') || seg.includes('www.') || seg.includes('  \n') || seg.includes('mailto:') || seg.includes('xmpp:')) return null;
+  // One regex test over the segment (the same six substrings the includes
+  // checks below used to test one by one). Micro-benched on 34,189 real
+  // segments from the practice set: 6.4ms vs 14.8ms for 6x includes
+  // (2.3x faster), 100% agreement. TEXT_FALLBACK has no /g flag, so
+  // .test() is stateless here.
+  if (TEXT_FALLBACK.test(seg)) return null;
   return { type: 'text', raw: seg, text: inRawBlock ? seg : Ie(seg), escaped: inRawBlock };
 }
 
@@ -747,44 +758,104 @@ _.prototype.list = function (src) {
 };
 
 // ---------------------------------------------------------------------------
-// v3 step 3: fast inlineTokens for runs with no emphasis/strikethrough.
-// When an inline run contains no `*`, `_` or `~`, emStrong/del can never
-// fire, so the emStrong mask (#n) and the closer scan (Ae) are pure cost:
-// maskedSrc is only ever read by emStrong/del. This override runs a
-// first-char-dispatched #t loop with maskedSrc = src for those runs and
-// falls back to the original inlineTokens whenever `*`, `_` or `~` (or a
-// custom emStrongMask / overridden emStrong/del) is present, so the
-// closer-scan cache stays exactly as the original builds it.
-// Differentially verified: 0/720 practice + 0/189 inline-focused fuzz
-// cases (combined with the v3 list override + block guards).
+// v4: unified fast inlineTokens for ALL runs (v3 only fast-pathed runs
+// without emphasis). This override reimplements Lexer#e + #t (the private
+// methods cannot be called from an override, so the mask step is copied
+// below as maskSrcOriginal): it builds maskedSrc, pushes the closer-scan
+// cache (Ae/Ee) exactly as #e does, and runs the first-char-dispatched
+// #t loop (fastInlineTokens) for every run, emphasis included.
+//   - Runs without `*`, `_`, `~`: emStrong/del can never fire, so the
+//     mask and the closer scan are skipped entirely (v3 behaviour).
+//   - Runs with emphasis: #n's three replaces are all no-ops when the
+//     run holds no backtick, backslash, '[' or '<' (reflinkSearch needs
+//     '[', the punctuation mask needs '`' or '\', blockSkip needs '[',
+//     '`' or '<'), so maskedSrc IS src there and the replaces are
+//     skipped; otherwise maskSrcOriginal runs the exact #n logic.
+// A custom emStrongMask hook or overridden emStrong/del falls back to
+// the original inlineTokens, so the closer-scan cache stays exactly as
+// the original builds it in every case.
 // ---------------------------------------------------------------------------
 
 const _inlineTokensOriginal = O.prototype.inlineTokens;
 const _protoEmStrong = _.prototype.emStrong;
 const _protoDel = _.prototype.del;
 const HAS_EM = /[*_~]/;
+const HAS_MASK_CHARS = /[`\\[<]/;
+
+// Byte-for-byte copy of Lexer#n (private, so it cannot be called from an
+// override). Used only when the run holds a mask-relevant character.
+function maskSrcOriginal(lexer, e) {
+  let t = e;
+  if (lexer.tokens.links && e.includes('[')) {
+    const n = lexer.tokenizer.rules.inline.reflinkSearch;
+    const s = (r) => {
+      const o = r.lastIndexOf('[');
+      if (!Object.hasOwn(lexer.tokens.links, F(r.slice(o + 1, -1)))) return r;
+      if (o > 1 && r.charAt(0) !== '!') {
+        const i = r.slice(1, o - 1);
+        if (lexer.linkInText(i)) return '[' + i.replace(n, s) + '][' + 'a'.repeat(r.length - o - 2) + ']';
+      }
+      return '[' + 'a'.repeat(r.length - 2) + ']';
+    };
+    t = t.replace(n, s);
+  }
+  t = t.replace(lexer.tokenizer.rules.inline.anyPunctuationOutsideCode, (n, s, r) => r ? '+'.repeat(n.length) : s ? s + n.slice(s.length, -s.length).replace(/`/g, '+') + s : n);
+  t = t.replace(lexer.tokenizer.rules.inline.blockSkip, (n, s, r) => { const o = r ? r.length : 0; return n.slice(0, o) + '[' + 'a'.repeat(n.length - o - 2) + ']'; });
+  return lexer.options.hooks?.emStrongMask?.call({ lexer }, t) ?? t;
+}
 
 O.prototype.inlineTokens = function (src, tokens = []) {
-  // One regex pass (not three includes) to decide the fast path.
-  const needsMask = HAS_EM.test(src)
-    || this.options.hooks?.emStrongMask
+  // Custom emStrongMask hook or overridden emStrong/del: the original
+  // #e/#n machinery must run untouched.
+  if (this.options.hooks?.emStrongMask
     || this.tokenizer.emStrong !== _protoEmStrong
-    || this.tokenizer.del !== _protoDel;
-  if (needsMask) {
+    || this.tokenizer.del !== _protoDel) {
     return _inlineTokensOriginal.call(this, src, tokens);
   }
 
-  // Fast path: no *, _, ~ in the run. maskedSrc is never read, so the
-  // mask and the closer scan are skipped entirely. Mirror the wrapper
-  // of the original inlineTokens (lexer link + linkParenPossible).
+  // Mirror the wrapper of the original inlineTokens (lexer link +
+  // linkParenPossible).
   this.tokenizer.lexer = this;
   const savedLinkParen = this.state.linkParenPossible;
   this.state.linkParenPossible = savedLinkParen && src.includes(')');
   try {
-    return fastInlineTokens(this, src, src, tokens);
+    if (!HAS_EM.test(src)) {
+      // No *, _, ~ in the run. maskedSrc is never read, so the mask
+      // and the closer scan are skipped entirely.
+      return fastInlineTokens(this, src, src, tokens);
+    }
+    // Emphasis present: build maskedSrc exactly as #n would, push the
+    // closer-scan cache exactly as #e does, run the #t loop.
+    const masked = HAS_MASK_CHARS.test(src) ? maskSrcOriginal(this, src) : src;
+    Ae(this.tokenizer, masked);
+    try {
+      return fastInlineTokens(this, src, masked, tokens);
+    } finally {
+      Ee(this.tokenizer);
+    }
   } finally {
     this.state.linkParenPossible = savedLinkParen;
   }
+};
+
+// ---------------------------------------------------------------------------
+// v4: skip the carriage-return normalisation in Lexer.lex when the input
+// holds no '\r' (1/720 practice docs do). String.replace with no match
+// returns its input unchanged, and /\r\n|\r/g cannot match without '\r',
+// so this is exactly equivalent, just without the regex scan over the
+// whole document. Micro-benched: 0.3ms vs 3.2ms per parse-all.
+// (A verbatim copy of Lexer.lex with only that guard added.)
+// ---------------------------------------------------------------------------
+O.prototype.lex = function (src) {
+  if (src.includes('\r')) src = src.replace(T.carriageReturn, '\n');
+  this.blockTokens(src, this.tokens);
+  for (let t = 0; t < this.inlineQueue.length; t++) {
+    const n = this.inlineQueue[t];
+    this.state.inRawBlock = false;
+    this.inlineTokens(n.src, n.tokens);
+  }
+  this.inlineQueue = [];
+  return this.tokens;
 };
 
 // Faithful reimplementation of Lexer#t, with the per-token method calls
@@ -842,10 +913,10 @@ function fastInlineTokens(lexer, src, maskedSrc, tokens) {
     } else if (c === 32) { // space: br
       i = tz.br(e);
       if (i) { e = e.substring(i.raw.length); n.push(i); continue; }
-    } else if (c === 42 || c === 95) { // '*' or '_': emStrong (unreachable here)
+    } else if (c === 42 || c === 95) { // '*' or '_': emStrong
       i = tz.emStrong(e, maskedSrc, r);
       if (i) { e = e.substring(i.raw.length); n.push(i); continue; }
-    } else if (c === 126) { // '~': del (unreachable here)
+    } else if (c === 126) { // '~': del
       i = tz.del(e, maskedSrc, r);
       if (i) { e = e.substring(i.raw.length); n.push(i); continue; }
     }
