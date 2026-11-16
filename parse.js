@@ -271,3 +271,609 @@ _.prototype.url = function (src) {
   const ok = (c >= 48 && c <= 57) || (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || c === 46 || c === 95 || c === 43 || c === 45;
   return ok ? _urlOriginal.call(this, src) : undefined;
 };
+
+// ---------------------------------------------------------------------------
+// v3 step 1: fast path for Tokenizer.list. A line-for-line translation of
+// marked 18.1.3's Tokenizer.list (MIT) with these exact-behaviour fast paths:
+//  (a) the six per-line .test() break checks become one char-based scan
+//      (listBreakKind); ambiguous lines fall back to the original regexes.
+//  (b) leading-tab expansion skipped when the leading run has no tab.
+//  (c) .search(nonSpaceChar) replaced by a manual scan (returns -1 for an
+//      all-space string, exactly like the regex).
+//  (d) split('\n', 1)[0] replaced by indexOf + slice.
+//  (e) the setext-underline regex replaced by a char scan.
+// Differentially verified: 0/720 practice + 0/162 list-focused fuzz cases.
+// ---------------------------------------------------------------------------
+
+function expandTabsFast(str, indent = 0) {
+  let col = indent;
+  let out = '';
+  for (const ch of str) {
+    if (ch === '\t') { const n = 4 - (col % 4); out += ' '.repeat(n); col += n; }
+    else { out += ch; col++; }
+  }
+  return out;
+}
+
+// First index of a char that is not a space; -1 when there is none
+// (identical to str.search(/[^ ]/)).
+function firstNonSpace(str) {
+  let i = 0;
+  const n = str.length;
+  while (i < n && str.charCodeAt(i) === 32) i++;
+  return i < n ? i : -1;
+}
+
+// First non-space position after expanding each tab to 4 spaces, as
+// str.replace(/\t/g, '    ').search(/[^ ]/); -1 when the string is all
+// spaces/tabs.
+function firstNonSpaceTabExpanded(str) {
+  let pos = 0;
+  const n = str.length;
+  for (let i = 0; i < n; i++) {
+    const c = str.charCodeAt(i);
+    if (c === 32) pos++;
+    else if (c === 9) pos += 4;
+    else return pos;
+  }
+  return -1;
+}
+
+// Expand the leading spaces/tabs of str (tabs via expandTabs, starting at
+// column bulletIndent). When the leading run holds no tab the replace is a
+// no-op, so the original string is returned untouched.
+function expandLeading(str, bulletIndent, leadingSpaceTabRe) {
+  let i = 0;
+  const n = str.length;
+  let hasTab = false;
+  while (i < n) {
+    const c = str.charCodeAt(i);
+    if (c === 32) i++;
+    else if (c === 9) { hasTab = true; i++; }
+    else break;
+  }
+  if (!hasTab) return str;
+  return str.replace(leadingSpaceTabRe, (ws) => expandTabsFast(ws, bulletIndent));
+}
+
+function firstLineOf(str) {
+  const nl = str.indexOf('\n');
+  return nl < 0 ? str : str.slice(0, nl);
+}
+
+// Bitmask of which block-start rules can match at the start of `line`:
+//   1 fences, 2 heading, 4 html, 8 blockquote, 16 nextBullet, 32 hr.
+// Returns -1 when the line is ambiguous and the caller must run the
+// original regexes (only possible for a heading followed by a unicode
+// space, which the heading regex's \s would accept).
+function listBreakKind(line, indent, pedantic, htmlRe) {
+  // The six regexes are built by cachedIndentRegex: the indent they allow
+  // is clamp(indent - 1, 0, 3), NOT indent itself. A nested bullet with
+  // two leading spaces does NOT end an item of indent 2 (the regex only
+  // allows one space), so the effective indent must be computed the same
+  // way or nested lists break apart.
+  const eff = Math.max(0, Math.min(3, indent - 1));
+  const n = line.length;
+  let i = 0;
+  while (i < n && i < eff && line.charCodeAt(i) === 32) i++;
+  if (i >= n) return 0;
+  if (i === eff && line.charCodeAt(i) === 32) return 0; // >eff spaces
+  const c = line.charCodeAt(i);
+  if (c === 96 || c === 126) { // ` or ~
+    return (line.charCodeAt(i + 1) === c && line.charCodeAt(i + 2) === c) ? 1 : 0;
+  }
+  if (c === 35) { // #
+    if (pedantic) return 2;
+    let j = i;
+    let cnt = 0;
+    while (j < n && line.charCodeAt(j) === 35 && cnt < 7) { j++; cnt++; }
+    if (cnt > 6) return 0;
+    if (j >= n) return 2;
+    const c2 = line.charCodeAt(j);
+    if (c2 === 32 || c2 === 9) return 2;
+    if (c2 >= 33 && c2 <= 126) return 0;
+    return -1;
+  }
+  if (c === 60) { // <
+    return htmlRe.test(line) ? 4 : 0;
+  }
+  if (c === 62) return 8; // >
+  if (c === 42 || c === 45 || c === 43) { // * - +
+    let kind = 0;
+    const after = line.charCodeAt(i + 1);
+    if (i + 1 >= n || after === 32 || after === 9) kind |= 16;
+    if (c !== 43) {
+      let p = i;
+      let count = 0;
+      while (p < n) {
+        const cc = line.charCodeAt(p);
+        if (cc === c) { count++; p++; }
+        else if (cc === 32 || cc === 9) p++;
+        else break;
+      }
+      if (count >= 3 && p >= n) kind |= 32;
+    }
+    return kind;
+  }
+  if (c >= 48 && c <= 57) { // digit: ordered bullet
+    let j = i;
+    let digits = 0;
+    while (j < n && line.charCodeAt(j) >= 48 && line.charCodeAt(j) <= 57 && digits < 10) { j++; digits++; }
+    if (digits > 9) return 0;
+    const d = line.charCodeAt(j);
+    if (d !== 46 && d !== 41) return 0; // . or )
+    const after = line.charCodeAt(j + 1);
+    if (j + 1 >= n || after === 32 || after === 9) return 16;
+    return 0;
+  }
+  return 0;
+}
+
+// Exact char version of /^ {0,3}(?:=+|-+) *$/ (setext underline line).
+function isSetextUnderline(line) {
+  const n = line.length;
+  let i = 0;
+  while (i < n && i < 3 && line.charCodeAt(i) === 32) i++;
+  if (i >= n) return false;
+  const c = line.charCodeAt(i);
+  if (c !== 61 && c !== 45) return false;
+  let j = i;
+  while (j < n && line.charCodeAt(j) === c) j++;
+  if (j === i) return false;
+  while (j < n && line.charCodeAt(j) === 32) j++;
+  return j >= n;
+}
+
+const _listOriginal = _.prototype.list;
+_.prototype.list = function (src) {
+  let cap = this.rules.block.list.exec(src);
+  if (cap) {
+    const listSrc = src;
+    const taken = () => listSrc.length - src.length;
+    let bull = cap[1].trim();
+    const isordered = bull.length > 1;
+
+    const list = {
+      type: 'list',
+      raw: '',
+      ordered: isordered,
+      start: isordered ? +bull.slice(0, -1) : '',
+      loose: false,
+      items: [],
+    };
+
+    bull = isordered ? `\\d{1,9}\\${bull.slice(-1)}` : `\\${bull}`;
+
+    if (this.options.pedantic) {
+      bull = isordered ? bull : '[*+-]';
+    }
+
+    const itemRegex = this.rules.other.listItemRegex(bull);
+    let endsWithBlankLine = false;
+    while (src) {
+      let endEarly = false;
+      let itemContents = '';
+      if (!(cap = itemRegex.exec(src))) {
+        break;
+      }
+
+      if (this.rules.block.hr.test(src)) {
+        break;
+      }
+
+      const itemStart = taken();
+      src = src.substring(cap[0].length);
+
+      const firstLine = firstLineOf(cap[2]);
+      const bulletIndent = cap[1].length;
+      let line = this.options.pedantic
+        ? expandTabsFast(firstLine, bulletIndent)
+        : expandLeading(firstLine, bulletIndent, this.rules.other.leadingSpaceTab);
+      let nextLine = firstLineOf(src);
+      let blankLine = !line.trim();
+
+      let indent = 0;
+      if (this.options.pedantic) {
+        indent = 2;
+        itemContents = line.trimStart();
+      } else if (blankLine) {
+        indent = bulletIndent + 1;
+      } else {
+        indent = firstNonSpace(line);
+        indent = indent > 4 ? 1 : indent;
+        itemContents = line.slice(indent);
+        indent += bulletIndent;
+      }
+
+      if (blankLine && this.rules.other.blankLine.test(nextLine)) {
+        src = src.substring(nextLine.length + 1);
+        endEarly = true;
+      }
+
+      if (!endEarly) {
+        const nextBulletRegex = this.rules.other.nextBulletRegex(indent);
+        const hrRegex = this.rules.other.hrRegex(indent);
+        const fencesBeginRegex = this.rules.other.fencesBeginRegex(indent);
+        const headingBeginRegex = this.options.pedantic
+          ? this.rules.other.pedanticHeadingBeginRegex(indent)
+          : this.rules.other.headingBeginRegex(indent);
+        const htmlBeginRegex = this.rules.other.htmlBeginRegex(indent);
+        const blockquoteBeginRegex = this.rules.other.blockquoteBeginRegex(indent);
+
+        while (src) {
+          const rawLine = firstLineOf(src);
+          let nextLineWithoutTabs;
+          nextLine = rawLine;
+
+          if (this.options.pedantic) {
+            nextLine = nextLine.replace(this.rules.other.listReplaceNesting, '  ');
+            nextLineWithoutTabs = nextLine;
+          } else {
+            nextLineWithoutTabs = expandLeading(nextLine, 0, this.rules.other.leadingSpaceTab);
+          }
+
+          // End list item if the line starts a new block (fast char check,
+          // original regexes only when ambiguous).
+          const kind = listBreakKind(nextLine, indent, this.options.pedantic, htmlBeginRegex);
+          if (kind === -1
+            ? (fencesBeginRegex.test(nextLine) || headingBeginRegex.test(nextLine) || htmlBeginRegex.test(nextLine) || blockquoteBeginRegex.test(nextLine) || nextBulletRegex.test(nextLine) || hrRegex.test(nextLine))
+            : kind !== 0) {
+            break;
+          }
+
+          if (firstNonSpace(nextLineWithoutTabs) >= indent || !nextLine.trim()) {
+            itemContents += '\n' + nextLineWithoutTabs.slice(indent);
+          } else {
+            if (blankLine) {
+              break;
+            }
+
+            if (firstNonSpaceTabExpanded(line) >= 4) {
+              break;
+            }
+            const prevKind = listBreakKind(line, indent, this.options.pedantic, htmlBeginRegex);
+            if (prevKind === -1
+              ? (fencesBeginRegex.test(line) || headingBeginRegex.test(line) || htmlBeginRegex.test(line) || hrRegex.test(line))
+              : (prevKind & (1 | 2 | 4 | 32)) !== 0) {
+              break;
+            }
+
+            const setextContinuation = !this.options.pedantic
+              && isSetextUnderline(nextLine)
+              && this.rules.block.lheading.test(`${line}\n${nextLine}`);
+            const continuation = setextContinuation
+              ? `    ${nextLineWithoutTabs.replace(/^ {0,3}/, '')}`
+              : nextLine;
+            itemContents += '\n' + continuation;
+          }
+
+          blankLine = !nextLine.trim();
+
+          src = src.substring(rawLine.length + 1);
+          line = nextLineWithoutTabs.slice(indent);
+        }
+      }
+
+      const raw = listSrc.slice(itemStart, taken());
+
+      if (!list.loose) {
+        if (endsWithBlankLine) {
+          list.loose = true;
+        } else if (this.rules.other.doubleBlankLine.test(raw)) {
+          endsWithBlankLine = true;
+        }
+      }
+
+      list.items.push({
+        type: 'list_item',
+        raw,
+        task: !!this.options.gfm && this.rules.other.listIsTask.test(itemContents),
+        loose: false,
+        text: itemContents,
+        tokens: [],
+      });
+    }
+
+    const lastItem = list.items.at(-1);
+    if (lastItem) {
+      lastItem.raw = lastItem.raw.trimEnd();
+      lastItem.text = lastItem.text.trimEnd();
+    } else {
+      return;
+    }
+    list.raw = listSrc.slice(0, taken()).trimEnd();
+
+    for (const item of list.items) {
+      this.lexer.state.top = false;
+      item.tokens = this.lexer.blockTokens(item.text, []);
+
+      if (!list.loose) {
+        const spacers = item.tokens.filter(t => t.type === 'space');
+        const hasMultipleLineBreaks = spacers.length > 0 && spacers.some(t => this.rules.other.anyLine.test(t.raw));
+        list.loose = hasMultipleLineBreaks;
+      }
+    }
+
+    for (const item of list.items) {
+      const itemToken = item.tokens[0];
+      if (item.task && (itemToken?.type === 'text' || itemToken?.type === 'paragraph')) {
+        item.text = item.text.replace(this.rules.other.listReplaceTask, '');
+        itemToken.raw = itemToken.raw.replace(this.rules.other.listReplaceTask, '');
+        itemToken.text = itemToken.text.replace(this.rules.other.listReplaceTask, '');
+        for (let i = this.lexer.inlineQueue.length - 1; i >= 0; i--) {
+          if (this.rules.other.listIsTask.test(this.lexer.inlineQueue[i].src)) {
+            this.lexer.inlineQueue[i].src = this.lexer.inlineQueue[i].src.replace(this.rules.other.listReplaceTask, '');
+            break;
+          }
+        }
+
+        const taskRaw = this.rules.other.listTaskCheckbox.exec(item.raw);
+        if (taskRaw) {
+          const checkboxToken = {
+            type: 'checkbox',
+            raw: taskRaw[0] + ' ',
+            checked: taskRaw[0] !== '[ ]',
+          };
+          item.checked = checkboxToken.checked;
+          if (list.loose) {
+            if (item.tokens[0] && ['paragraph', 'text'].includes(item.tokens[0].type) && 'tokens' in item.tokens[0] && item.tokens[0].tokens) {
+              item.tokens[0].raw = checkboxToken.raw + item.tokens[0].raw;
+              item.tokens[0].text = checkboxToken.raw + item.tokens[0].text;
+              item.tokens[0].tokens.unshift(checkboxToken);
+            } else {
+              item.tokens.unshift({
+                type: 'paragraph',
+                raw: checkboxToken.raw,
+                text: checkboxToken.raw,
+                tokens: [checkboxToken],
+              });
+            }
+          } else {
+            item.tokens.unshift(checkboxToken);
+          }
+        }
+      } else if (item.task) {
+        item.task = false;
+      }
+    }
+
+    if (list.loose) {
+      for (const item of list.items) {
+        item.loose = true;
+        for (const token of item.tokens) {
+          if (token.type === 'text') {
+            token.type = 'paragraph';
+          }
+        }
+      }
+    }
+
+    return list;
+  }
+};
+
+// ---------------------------------------------------------------------------
+// v3 step 2: first-character guards for the block tokenizer methods.
+// Every guard is a NECESSARY condition for its rule's regex (the regex is
+// anchored and, after at most 3 leading spaces, starts with a fixed
+// character or character class), so a skipped call returns exactly what
+// the original would: undefined. The guards replace a regex exec with a
+// few charCodeAt calls. Differentially verified: 0/720 practice + 0/264
+// block-focused fuzz cases (combined with the v3 list override).
+// ---------------------------------------------------------------------------
+
+// First non-space character of src, plus how many leading spaces there
+// are. Returns { sp, ch } where ch is the charCode of the first non-space
+// char, or -1 for a blank/EOL-only start. (A tab counts as a non-space
+// char here: the block rules' ` {0,3}` prefix matches literal spaces only.)
+function firstNonSpace3(src) {
+  let sp = 0;
+  const n = src.length;
+  while (sp < n && src.charCodeAt(sp) === 32) sp++;
+  if (sp >= n) return { sp, ch: -1 };
+  return { sp, ch: src.charCodeAt(sp) };
+}
+
+const _spaceOriginal = _.prototype.space;
+_.prototype.space = function (src) {
+  const c = src.charCodeAt(0);
+  return (c === 10 || c === 32 || c === 9) ? _spaceOriginal.call(this, src) : undefined;
+};
+
+const _codeOriginal = _.prototype.code;
+_.prototype.code = function (src) {
+  // indented code needs 4 spaces, or 0-3 spaces then a tab
+  let i = 0;
+  const n = src.length;
+  while (i < n && i < 4 && src.charCodeAt(i) === 32) i++;
+  if (i >= 4) return _codeOriginal.call(this, src);
+  if (i < n && src.charCodeAt(i) === 9) return _codeOriginal.call(this, src);
+  return undefined;
+};
+
+const _fencesOriginal = _.prototype.fences;
+_.prototype.fences = function (src) {
+  const { sp, ch } = firstNonSpace3(src);
+  if (sp > 3) return undefined;
+  if (ch !== 96 && ch !== 126) return undefined;
+  if (src.charCodeAt(sp + 1) !== ch || src.charCodeAt(sp + 2) !== ch) return undefined;
+  return _fencesOriginal.call(this, src);
+};
+
+const _headingOriginal = _.prototype.heading;
+_.prototype.heading = function (src) {
+  const { sp, ch } = firstNonSpace3(src);
+  if (sp > 3 || ch !== 35) return undefined;
+  return _headingOriginal.call(this, src);
+};
+
+const _hrOriginal = _.prototype.hr;
+_.prototype.hr = function (src) {
+  const { sp, ch } = firstNonSpace3(src);
+  if (sp > 3 || (ch !== 45 && ch !== 95 && ch !== 42)) return undefined;
+  return _hrOriginal.call(this, src);
+};
+
+const _blockquoteOriginal = _.prototype.blockquote;
+_.prototype.blockquote = function (src) {
+  const { sp, ch } = firstNonSpace3(src);
+  if (sp > 3 || ch !== 62) return undefined;
+  return _blockquoteOriginal.call(this, src);
+};
+
+const _htmlOriginal = _.prototype.html;
+_.prototype.html = function (src) {
+  const { sp, ch } = firstNonSpace3(src);
+  if (sp > 3 || ch !== 60) return undefined;
+  return _htmlOriginal.call(this, src);
+};
+
+const _defOriginal = _.prototype.def;
+_.prototype.def = function (src) {
+  const { sp, ch } = firstNonSpace3(src);
+  if (sp > 3 || ch !== 91) return undefined;
+  return _defOriginal.call(this, src);
+};
+
+// list: the v3 list override starts with the block.list regex, whose
+// bullet needs at most 3 spaces then *+- or a digit. Guard it so a
+// plain-text position never runs the list regex.
+const _listGuarded = _.prototype.list;
+_.prototype.list = function (src) {
+  const { sp, ch } = firstNonSpace3(src);
+  if (sp > 3) return undefined;
+  if (ch !== 42 && ch !== 43 && ch !== 45 && !(ch >= 48 && ch <= 57)) return undefined;
+  return _listGuarded.call(this, src);
+};
+
+// ---------------------------------------------------------------------------
+// v3 step 3: fast inlineTokens for runs with no emphasis/strikethrough.
+// When an inline run contains no `*`, `_` or `~`, emStrong/del can never
+// fire, so the emStrong mask (#n) and the closer scan (Ae) are pure cost:
+// maskedSrc is only ever read by emStrong/del. This override runs a
+// first-char-dispatched #t loop with maskedSrc = src for those runs and
+// falls back to the original inlineTokens whenever `*`, `_` or `~` (or a
+// custom emStrongMask / overridden emStrong/del) is present, so the
+// closer-scan cache stays exactly as the original builds it.
+// Differentially verified: 0/720 practice + 0/189 inline-focused fuzz
+// cases (combined with the v3 list override + block guards).
+// ---------------------------------------------------------------------------
+
+const _inlineTokensOriginal = O.prototype.inlineTokens;
+const _protoEmStrong = _.prototype.emStrong;
+const _protoDel = _.prototype.del;
+const HAS_EM = /[*_~]/;
+
+O.prototype.inlineTokens = function (src, tokens = []) {
+  // One regex pass (not three includes) to decide the fast path.
+  const needsMask = HAS_EM.test(src)
+    || this.options.hooks?.emStrongMask
+    || this.tokenizer.emStrong !== _protoEmStrong
+    || this.tokenizer.del !== _protoDel;
+  if (needsMask) {
+    return _inlineTokensOriginal.call(this, src, tokens);
+  }
+
+  // Fast path: no *, _, ~ in the run. maskedSrc is never read, so the
+  // mask and the closer scan are skipped entirely. Mirror the wrapper
+  // of the original inlineTokens (lexer link + linkParenPossible).
+  this.tokenizer.lexer = this;
+  const savedLinkParen = this.state.linkParenPossible;
+  this.state.linkParenPossible = savedLinkParen && src.includes(')');
+  try {
+    return fastInlineTokens(this, src, src, tokens);
+  } finally {
+    this.state.linkParenPossible = savedLinkParen;
+  }
+};
+
+// Faithful reimplementation of Lexer#t, with the per-token method calls
+// replaced by a first-char dispatch. Each tokenizer method's rule is
+// anchored and starts with a fixed first character, so the dispatch is
+// exact: a method is only called when its first character matches.
+// maskedSrc is the unmasked src (the fast path never has emphasis).
+// Note: br also matches a backslash-newline (its regex is
+// /^( {2,}|\\\\)\n.../), so the backslash branch tries br after escape.
+function fastInlineTokens(lexer, src, maskedSrc, tokens) {
+  const tz = lexer.tokenizer;
+  const extInline = lexer.options.extensions?.inline;
+  const extStartInline = lexer.options.extensions?.startInline;
+  let s = false; // previous token was inline text
+  let r = ''; // last char of previous text token ("" unless s)
+  let o = Infinity; // previous remaining length (infinite-loop guard)
+  let e = src;
+  const n = tokens;
+  for (; e;) {
+    if (e.length < o) o = e.length;
+    else { lexer.infiniteLoopError(e.charCodeAt(0)); break; }
+    if (!s) r = '';
+    s = false;
+    let i;
+    if (extInline?.some((p) => (i = p.call({ lexer }, e, n))
+      ? (e = e.substring(i.raw.length), n.push(i), true) : false)) continue;
+
+    const c = e.charCodeAt(0);
+    // escape: first char backslash. br also matches a backslash-newline,
+    // so try br after escape fails.
+    if (c === 92) {
+      i = tz.escape(e);
+      if (i) { e = e.substring(i.raw.length); n.push(i); continue; }
+      i = tz.br(e);
+      if (i) { e = e.substring(i.raw.length); n.push(i); continue; }
+    } else if (c === 60) { // '<': tag, then autolink
+      i = tz.tag(e);
+      if (i) { e = e.substring(i.raw.length); n.push(i); continue; }
+      i = tz.autolink(e);
+      if (i) { e = e.substring(i.raw.length); n.push(i); continue; }
+    } else if (c === 91 || c === 33) { // '[' or '!': link, then reflink
+      i = tz.link(e);
+      if (i) { e = e.substring(i.raw.length); n.push(i); continue; }
+      i = tz.reflink(e, lexer.tokens.links);
+      if (i) {
+        e = e.substring(i.raw.length);
+        const p = n.at(-1);
+        if (i.type === 'text' && p?.type === 'text') { p.raw += i.raw; p.text += i.text; }
+        else n.push(i);
+        continue;
+      }
+    } else if (c === 96) { // backtick: codespan
+      i = tz.codespan(e);
+      if (i) { e = e.substring(i.raw.length); n.push(i); continue; }
+    } else if (c === 32) { // space: br
+      i = tz.br(e);
+      if (i) { e = e.substring(i.raw.length); n.push(i); continue; }
+    } else if (c === 42 || c === 95) { // '*' or '_': emStrong (unreachable here)
+      i = tz.emStrong(e, maskedSrc, r);
+      if (i) { e = e.substring(i.raw.length); n.push(i); continue; }
+    } else if (c === 126) { // '~': del (unreachable here)
+      i = tz.del(e, maskedSrc, r);
+      if (i) { e = e.substring(i.raw.length); n.push(i); continue; }
+    }
+    // url (only outside a link), then the text fallback.
+    if (!lexer.state.inLink && (i = tz.url(e))) {
+      e = e.substring(i.raw.length); n.push(i); continue;
+    }
+    let l = e;
+    if (extStartInline) {
+      let p = Infinity;
+      const h = e.slice(1);
+      let u;
+      extStartInline.forEach((d) => {
+        u = d.call({ lexer }, h);
+        if (typeof u === 'number' && u >= 0) p = Math.min(p, u);
+      });
+      if (p < Infinity && p >= 0) l = e.substring(0, p + 1);
+    }
+    if (i = tz.inlineText(l)) {
+      e = e.substring(i.raw.length);
+      if (i.raw.slice(-1) !== '_') r = i.raw.slice(-1);
+      s = true;
+      const p = n.at(-1);
+      if (p?.type === 'text') { p.raw += i.raw; p.text += i.text; }
+      else n.push(i);
+      continue;
+    }
+    if (e) { lexer.infiniteLoopError(e.charCodeAt(0)); break; }
+  }
+  return n;
+}
