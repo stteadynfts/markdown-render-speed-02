@@ -125,7 +125,9 @@ function fastTextRun(src, inRawBlock) {
   }
   if (stop === 0) return null;
   const seg = stop < 0 ? src : src.slice(0, stop);
-  if (TEXT_FALLBACK.test(seg)) return null;
+  // Same set as TEXT_FALLBACK, as plain substring checks: String.includes
+  // is a memmem scan and far cheaper than the alternation regex per segment.
+  if (seg.includes('@') || seg.includes('://') || seg.includes('www.') || seg.includes('  \n') || seg.includes('mailto:') || seg.includes('xmpp:')) return null;
   return { type: 'text', raw: seg, text: inRawBlock ? seg : Ie(seg), escaped: inRawBlock };
 }
 
@@ -134,4 +136,138 @@ _.prototype.inlineText = function (src) {
   const fast = fastTextRun(src, this.lexer.state.inRawBlock);
   if (fast) return fast;
   return _inlineTextOriginal.call(this, src);
+};
+
+// ---------------------------------------------------------------------------
+// v2: cheap necessary-condition guards. Every guard below only skips a rule
+// whose regex cannot match at this position (its first character is fixed),
+// so a skipped call returns exactly what the original would: undefined.
+// The guards replace a regex exec (~100ns, often scanning ahead) with one
+// charCodeAt. The originals are kept for the fallback.
+// ---------------------------------------------------------------------------
+
+// --- block: lheading needs a setext underline line (spaces + =/- run +
+// spaces/tabs) after at least one content line and before the first blank
+// line. No such line => the rule cannot match.
+function hasSetextUnderline(src) {
+  const n = src.length;
+  let pos = 0;
+  let lineNo = 0;
+  while (pos < n) {
+    let eol = src.indexOf('\n', pos);
+    if (eol < 0) eol = n;
+    let i = pos;
+    let spaces = 0;
+    while (i < eol && src.charCodeAt(i) === 32 && spaces < 4) { i++; spaces++; }
+    if (i >= eol) {
+      // line of only spaces (<=4): blank, heading content cannot continue
+      // past it, so no underline can follow.
+      return false;
+    }
+    if (lineNo >= 1 && spaces <= 3) {
+      const c = src.charCodeAt(i);
+      if (c === 61 || c === 45) {
+        let j = i;
+        while (j < eol && src.charCodeAt(j) === c) j++;
+        if (j > i) {
+          let k = j;
+          while (k < eol) { const cc = src.charCodeAt(k); if (cc !== 32 && cc !== 9) break; k++; }
+          if (k >= eol) return true;
+        }
+      }
+    }
+    pos = eol + 1;
+    lineNo++;
+  }
+  return false;
+}
+
+const _lheadingOriginal = _.prototype.lheading;
+_.prototype.lheading = function (src) {
+  if (!hasSetextUnderline(src)) return undefined;
+  return _lheadingOriginal.call(this, src);
+};
+
+// --- block: a GFM table needs a header line then a delimiter line made of
+// only | : - and spaces (with at least one -), indented at most 3 spaces.
+function hasTableDelimiter(src) {
+  const nl = src.indexOf('\n');
+  if (nl < 0) return false;
+  let eol = src.indexOf('\n', nl + 1);
+  if (eol < 0) eol = src.length;
+  let i = nl + 1;
+  let spaces = 0;
+  while (i < eol && src.charCodeAt(i) === 32 && spaces < 4) { i++; spaces++; }
+  if (spaces > 3) return false;
+  let hasDash = false;
+  for (; i < eol; i++) {
+    const c = src.charCodeAt(i);
+    if (c === 45) hasDash = true;
+    else if (c !== 124 && c !== 58 && c !== 32) return false;
+  }
+  return hasDash;
+}
+
+const _tableOriginal = _.prototype.table;
+_.prototype.table = function (src) {
+  if (!hasTableDelimiter(src)) return undefined;
+  return _tableOriginal.call(this, src);
+};
+
+// --- inline: first-character guards (each rule's regex is anchored and its
+// first character is fixed, so a different first character means no match).
+const _escapeOriginal = _.prototype.escape;
+_.prototype.escape = function (src) {
+  return src.charCodeAt(0) === 92 ? _escapeOriginal.call(this, src) : undefined;
+};
+
+const _tagOriginal = _.prototype.tag;
+_.prototype.tag = function (src) {
+  return src.charCodeAt(0) === 60 ? _tagOriginal.call(this, src) : undefined;
+};
+
+const _linkOriginal = _.prototype.link;
+_.prototype.link = function (src) {
+  const c = src.charCodeAt(0);
+  return (c === 91 || c === 33) ? _linkOriginal.call(this, src) : undefined;
+};
+
+const _reflinkOriginal = _.prototype.reflink;
+_.prototype.reflink = function (src, links) {
+  const c = src.charCodeAt(0);
+  return (c === 91 || c === 33) ? _reflinkOriginal.call(this, src, links) : undefined;
+};
+
+const _emStrongOriginal = _.prototype.emStrong;
+_.prototype.emStrong = function (src, maskedSrc, prevChar) {
+  const c = src.charCodeAt(0);
+  return (c === 42 || c === 95) ? _emStrongOriginal.call(this, src, maskedSrc, prevChar) : undefined;
+};
+
+const _codespanOriginal = _.prototype.codespan;
+_.prototype.codespan = function (src) {
+  return src.charCodeAt(0) === 96 ? _codespanOriginal.call(this, src) : undefined;
+};
+
+const _brOriginal = _.prototype.br;
+_.prototype.br = function (src) {
+  const c = src.charCodeAt(0);
+  return (c === 32 || c === 92) ? _brOriginal.call(this, src) : undefined;
+};
+
+const _delOriginal = _.prototype.del;
+_.prototype.del = function (src, maskedSrc, prevChar) {
+  return src.charCodeAt(0) === 126 ? _delOriginal.call(this, src, maskedSrc, prevChar) : undefined;
+};
+
+const _autolinkOriginal = _.prototype.autolink;
+_.prototype.autolink = function (src) {
+  return src.charCodeAt(0) === 60 ? _autolinkOriginal.call(this, src) : undefined;
+};
+
+const _urlOriginal = _.prototype.url;
+_.prototype.url = function (src) {
+  const c = src.charCodeAt(0);
+  const ok = (c >= 48 && c <= 57) || (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || c === 46 || c === 95 || c === 43 || c === 45;
+  return ok ? _urlOriginal.call(this, src) : undefined;
 };
