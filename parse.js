@@ -199,7 +199,7 @@ const reDelRDelim = build(delRDelimCore, 'gu')
 const reDel = /^(~~?)(?=[^\s~])((?:\\[\s\S]|[^\\])*?(?:\\[\s\S]|[^\s~\\]))\1(?=[^~]|$)/;
 const emStrongLCore = /^(?:\*+(?:((?!\*)punct)|([^\s*]))?)|^_+(?:((?!_)punct)|([^\s_]))?/;
 const reEmLDelim = build(emStrongLCore, 'u').sub(/punct/g, PUNCT_GFM).done();
-const emStrongRAstCore = String.raw`^[^_*]*?__[^_*]*?\*[^_*]*?(?=__)|[^*]+(?=[^*])|(?!\\*)punct(\*+)(?=[\s]|$)|notPunctSpace(\*+)(?!\\*)(?=punctSpace|$)|(?!\\*)punctSpace(\*+)(?=notPunctSpace)|[\s](\*+)(?!\\*)(?=punct)|(?!\\*)punct(\*+)(?!\\*)(?=punct)|notPunctSpace(\*+)(?=notPunctSpace)`;
+const emStrongRAstCore = String.raw`^[^_*]*?__[^_*]*?\*[^_*]*?(?=__)|[^*]+(?=[^*])|(?!\*)punct(\*+)(?=[\s]|$)|notPunctSpace(\*+)(?!\*)(?=punctSpace|$)|(?!\*)punctSpace(\*+)(?=notPunctSpace)|[\s](\*+)(?!\*)(?=punct)|(?!\*)punct(\*+)(?!\*)(?=punct)|notPunctSpace(\*+)(?=notPunctSpace)`;
 const reEmRDelimAst = build(emStrongRAstCore, 'gu')
   .sub(/notPunctSpace/g, NOT_PUNCT_SPACE_GFM)
   .sub(/punctSpace/g, PUNCT_SPACE_GFM)
@@ -833,6 +833,8 @@ function tokenizeInline(ctx, run, src, tokens) {
         // Only reflink returns a text token here; marked merges it but
         // does not let it set prevChar, so neither do we.
         mergeText(tokens, tok.raw, tok.text, tok.escaped);
+      } else {
+        tokens.push(tok);
       }
       continue;
     }
@@ -1519,7 +1521,8 @@ export function parse(src) {
     top: true,
     inLink: false,
     inRawBlock: false,
-    linkParenPossible: false,
+    linkEmitted: false,
+    linkParenPossible: true,
     links: {},
     inlineQueue: [],
   };
