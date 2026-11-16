@@ -254,9 +254,173 @@ _.prototype.tag = function (src) {
 };
 
 const _linkOriginal = _.prototype.link;
+
+// ---------------------------------------------------------------------------
+// v6 step 5: manual link fast path. Replaces the giant `yt` link regex exec
+// for plain labels; the regex stays as the fallback for everything else.
+// Fast path applies when (non-pedantic only):
+//   - src starts with '[' or '![' and the label (up to the first ']')
+//     holds no '[', '`', '\\' or '<' (no nesting, code spans, escapes,
+//     or tag-like '<' that Be() would have to vet);
+//   - ']' is followed by '(';
+//   - after optional [ \t\n]* the href is an angle href '<...>' with no
+//     '\\', '<' or '\n' inside, an empty href (')' at once), or a bare
+//     href run (no space/tab/newline/control chars);
+//   - after the href, optional [ \t\n]* + a '"' or '\'' title with no
+//     '\\' inside (a title needs at least one whitespace char before
+//     it, exactly like the regex separator), or no title, then
+//     [ \t\n]* + ')'.
+// The match array t = [raw, label, href, title] is built exactly as the
+// regex would build it, then link()'s post-processing (Be, angle check,
+// ke truncation, trailing-backslash L check, De) runs verbatim.
+// Parens inside a bare href are handled by ke() exactly as the original
+// does; a ke truncation with leading whitespace before the href bails,
+// because marked's h formula ignores that whitespace. linkFast returns
+// the token, undefined (definitively no link), or false (bail to the
+// original link()).
+// ---------------------------------------------------------------------------
+
+// Tail after an href: optional [ \t\n]*, optional title, [ \t\n]*, ')'.
+// Returns { title, closePos } or false (bail to the original).
+function linkTail(src, i) {
+  const n = src.length;
+  let j = i;
+  while (j < n) {
+    const c = src.charCodeAt(j);
+    if (c === 32 || c === 9 || c === 10) j++;
+    else break;
+  }
+  if (j >= n) return false;
+  const c = src.charCodeAt(j);
+  if (c === 41) return { title: undefined, closePos: j }; // ')'
+  if (c === 34 || c === 39) { // '"' or '\'' title; needs whitespace before it
+    if (j === i) return false;
+    const q = c;
+    let k = j + 1;
+    while (k < n) {
+      const d = src.charCodeAt(k);
+      if (d === 92) return false; // escape inside title: bail
+      if (d === q) break;
+      k++;
+    }
+    if (k >= n) return false; // no closing quote
+    const title = src.slice(j, k + 1);
+    let m = k + 1;
+    while (m < n) {
+      const d = src.charCodeAt(m);
+      if (d === 32 || d === 9 || d === 10) m++;
+      else break;
+    }
+    if (m < n && src.charCodeAt(m) === 41) return { title, closePos: m };
+    return false;
+  }
+  return false; // '(' paren title or anything else: bail
+}
+
+function linkFast(tok, src) {
+  const n = src.length;
+  const isImage = src.charCodeAt(0) === 33; // '!'
+  const lb = isImage ? 1 : 0; // index of '['
+  if (src.charCodeAt(lb) !== 91) return false;
+  const labelStart = lb + 1;
+  const labelEnd = src.indexOf(']', labelStart);
+  if (labelEnd < 0) return false;
+  const label = src.slice(labelStart, labelEnd);
+  if (label.indexOf('[') !== -1 || label.indexOf('`') !== -1 ||
+      label.indexOf('\\') !== -1 || label.indexOf('<') !== -1) return false;
+  if (src.charCodeAt(labelEnd + 1) !== 40) return false; // '('
+  // Skip [ \t\n]* between '(' and the href.
+  let i = labelEnd + 2;
+  while (i < n) {
+    const c = src.charCodeAt(i);
+    if (c === 32 || c === 9 || c === 10) i++;
+    else break;
+  }
+  const leadWs = i - (labelEnd + 2);
+  let href, title, closePos;
+  if (i < n && src.charCodeAt(i) === 41) { // empty href: ')' at once
+    href = '';
+    title = undefined;
+    closePos = i;
+  } else if (i < n && src.charCodeAt(i) === 60) { // '<' angle href
+    const gt = src.indexOf('>', i + 1);
+    if (gt < 0) return false;
+    const inner = src.slice(i + 1, gt);
+    if (inner.length === 0) return false; // '<>' is not an angle href
+    if (inner.indexOf('\\') !== -1 || inner.indexOf('<') !== -1 ||
+        inner.indexOf('\n') !== -1) return false;
+    href = src.slice(i, gt + 1);
+    const tail = linkTail(src, gt + 1);
+    if (!tail) return false;
+    title = tail.title;
+    closePos = tail.closePos;
+  } else {
+    // Bare href run: no space/tab/newline/control chars (parens and
+    // quotes included; ke() sorts out the parens below).
+    let j = i;
+    while (j < n) {
+      const c = src.charCodeAt(j);
+      if (c === 32 || c === 9 || c === 10 || c < 32) break;
+      j++;
+    }
+    if (j === i) return false;
+    const run = src.slice(i, j);
+    const k = ke(run, '()');
+    if (k === -2) return false;
+    if (k > -1) {
+      if (leadWs > 0) return false; // marked's h formula ignores lead ws
+      href = run.slice(0, k);
+      title = undefined;
+      closePos = i + k; // the ')' that unbalances the run
+    } else {
+      href = run;
+      const tail = linkTail(src, j);
+      if (!tail) return false;
+      title = tail.title;
+      closePos = tail.closePos;
+    }
+  }
+  const t = [src.slice(0, closePos + 1), label, href, title];
+  // --- link() post-processing, verbatim (pedantic excluded above) ---
+  const nn = isImage ? 2 : 1;
+  if (Be(src, t[1], nn, tok.rules)) return undefined;
+  let s = t[2].trim();
+  if (tok.rules.other.startAngleBracket.test(s)) {
+    if (!tok.rules.other.endAngleBracket.test(s)) return undefined;
+    const l = L(s.slice(0, -1), '\\');
+    if ((s.length - l.length) % 2 === 0) return undefined;
+  } else {
+    const l = ke(t[2], '()');
+    if (l === -2) return undefined;
+    if (l > -1) {
+      const h = (t[0].indexOf('!') === 0 ? 5 : 4) + t[1].length + l;
+      t[2] = t[2].substring(0, l);
+      t[0] = t[0].substring(0, h).trim();
+      t[3] = '';
+    }
+  }
+  const r = L(t[0].slice(0, -1), '\\');
+  if ((t[0].length - r.length) % 2 === 0) return undefined;
+  let o = t[2], ii = '';
+  ii = t[3] ? t[3].slice(1, -1) : '';
+  o = o.trim();
+  if (tok.rules.other.startAngleBracket.test(o)) o = o.slice(1, -1);
+  const anyPunct = tok.rules.inline.anyPunctuation;
+  return De(t, {
+    href: o && (o.indexOf('\\') === -1 ? o : o.replace(anyPunct, '$1')),
+    title: ii && (ii.indexOf('\\') === -1 ? ii : ii.replace(anyPunct, '$1')),
+  }, t[0], tok.lexer, tok.rules);
+}
+
 _.prototype.link = function (src) {
   const c = src.charCodeAt(0);
-  return (c === 91 || c === 33) ? _linkOriginal.call(this, src) : undefined;
+  if (c !== 91 && c !== 33) return undefined;
+  if (this.lexer.state.linkParenPossible === false) return undefined;
+  if (!this.options.pedantic) {
+    const fast = linkFast(this, src);
+    if (fast !== false) return fast;
+  }
+  return _linkOriginal.call(this, src);
 };
 
 const _reflinkOriginal = _.prototype.reflink;
@@ -361,6 +525,24 @@ function expandLeading(str, bulletIndent, leadingSpaceTabRe) {
   }
   if (!hasTab) return str;
   return str.replace(leadingSpaceTabRe, (ws) => expandTabsFast(ws, bulletIndent));
+}
+
+// True when s is empty or holds only whitespace, exactly like !s.trim().
+// The set is ECMAScript White_Space + LineTerminator (tab, VT, FF,
+// space, NBSP, ZWNBSP, U+1680, U+2000-U+200A, U+202F, U+205F, U+3000,
+// LF, CR, LS, PS); all are BMP chars, so charCodeAt is exact. Avoids
+// the allocation of s.trim() on every list line.
+function isBlankLine(s) {
+  const n = s.length;
+  for (let i = 0; i < n; i++) {
+    const c = s.charCodeAt(i);
+    if (c === 32 || c === 9 || c === 11 || c === 12 || c === 10 || c === 13) continue;
+    if (c === 160 || c === 65279 || c === 0x1680 || c === 0x202f || c === 0x205f ||
+        c === 0x3000 || c === 0x2028 || c === 0x2029) continue;
+    if (c >= 0x2000 && c <= 0x200a) continue;
+    return false;
+  }
+  return true;
 }
 
 function firstLineOf(str) {
@@ -497,7 +679,7 @@ _.prototype.list = function (src) {
         ? expandTabsFast(firstLine, bulletIndent)
         : expandLeading(firstLine, bulletIndent, this.rules.other.leadingSpaceTab);
       let nextLine = firstLineOf(src);
-      let blankLine = !line.trim();
+      let blankLine = isBlankLine(line);
 
       let indent = 0;
       if (this.options.pedantic) {
@@ -548,7 +730,7 @@ _.prototype.list = function (src) {
             break;
           }
 
-          if (firstNonSpace(nextLineWithoutTabs) >= indent || !nextLine.trim()) {
+          if (firstNonSpace(nextLineWithoutTabs) >= indent || isBlankLine(nextLine)) {
             itemContents += '\n' + nextLineWithoutTabs.slice(indent);
           } else {
             if (blankLine) {
@@ -574,7 +756,7 @@ _.prototype.list = function (src) {
             itemContents += '\n' + continuation;
           }
 
-          blankLine = !nextLine.trim();
+          blankLine = isBlankLine(nextLine);
 
           src = src.substring(rawLine.length + 1);
           line = nextLineWithoutTabs.slice(indent);
@@ -1056,11 +1238,24 @@ function codeSpanEnd(src, pos) {
 // pattern of the mask regexes. Over-approximates: a label is protected
 // even when its ref is not a defined link (the mask would then be a
 // no-op for it, so protecting it only costs speed, never correctness).
+// Scans with native indexOf jumps to the next interesting char instead
+// of a per-character loop (labels and urls are long in docs).
 function linkSpanEnd(src, pos) {
   const n = src.length;
   let depth = 0;
   let i = pos;
-  while (i < n) {
+  for (;;) {
+    let next = -1;
+    let p = src.indexOf('[', i);
+    if (p !== -1) next = p;
+    p = src.indexOf(']', i);
+    if (p !== -1 && (next === -1 || p < next)) next = p;
+    p = src.indexOf('`', i);
+    if (p !== -1 && (next === -1 || p < next)) next = p;
+    p = src.indexOf('\\', i);
+    if (p !== -1 && (next === -1 || p < next)) next = p;
+    if (next === -1) return -1;
+    i = next;
     const c = src.charCodeAt(i);
     if (c === 92) { i += 2; continue; } // escape: skip next char
     if (c === 96) {
@@ -1070,49 +1265,73 @@ function linkSpanEnd(src, pos) {
       continue;
     }
     if (c === 91) { depth++; i++; continue; }
-    if (c === 93) {
-      depth--;
-      i++;
-      if (depth === 0) {
-        // label closed at i; extend over (...) url or [...] ref part
-        if (i < n && src.charCodeAt(i) === 40) {
-          let d = 0;
-          let j = i;
-          while (j < n) {
-            const cc = src.charCodeAt(j);
-            if (cc === 92) { j += 2; continue; }
-            if (cc === 40) d++;
-            else if (cc === 41) { d--; if (d === 0) return j + 1; }
-            j++;
-          }
-          return i; // unbalanced parens: protect the label alone
-        }
-        if (i < n && src.charCodeAt(i) === 91) {
-          // ref part: reuse the label scan from here
-          const refEnd = linkSpanEnd(src, i);
-          return refEnd < 0 ? i : refEnd;
-        }
-        return i; // nolink [...]: protect the label alone
-      }
-      continue;
-    }
+    // c === 93 (']'): label closes when depth returns to 0
+    depth--;
     i++;
+    if (depth !== 0) continue;
+    // label closed at i; extend over (...) url or [...] ref part
+    if (i < n && src.charCodeAt(i) === 40) {
+      let d = 0;
+      let j = i;
+      for (;;) {
+        let nx = -1;
+        let q = src.indexOf('(', j);
+        if (q !== -1) nx = q;
+        q = src.indexOf(')', j);
+        if (q !== -1 && (nx === -1 || q < nx)) nx = q;
+        q = src.indexOf('\\', j);
+        if (q !== -1 && (nx === -1 || q < nx)) nx = q;
+        if (nx === -1) return i; // unbalanced parens: protect label alone
+        j = nx;
+        const cc = src.charCodeAt(j);
+        if (cc === 92) { j += 2; continue; }
+        if (cc === 40) { d++; j++; continue; }
+        d--;
+        j++;
+        if (d === 0) return j;
+      }
+    }
+    if (i < n && src.charCodeAt(i) === 91) {
+      // ref part: reuse the label scan from here
+      const refEnd = linkSpanEnd(src, i);
+      return refEnd < 0 ? i : refEnd;
+    }
+    return i; // nolink [...]: protect the label alone
   }
-  return -1;
 }
 
 // True when the emphasis mask could change emStrong/del behaviour for
 // this run: some delimiter sits inside a masked span or is escaped.
+// Cheap necessary condition first: a delimiter can only be hidden
+// inside a span if some delimiter occurs at or after the first
+// span-start char (a delimiter before every span-start sits outside
+// all spans, since spans begin at span-start chars).
 function maskNeeded(src) {
   const n = src.length;
+  let firstSpan = -1;
+  let p = src.indexOf('\\', 0);
+  if (p !== -1) firstSpan = p;
+  p = src.indexOf('`', 0);
+  if (p !== -1 && (firstSpan === -1 || p < firstSpan)) firstSpan = p;
+  p = src.indexOf('[', 0);
+  if (p !== -1 && (firstSpan === -1 || p < firstSpan)) firstSpan = p;
+  p = src.indexOf('<', 0);
+  if (p !== -1 && (firstSpan === -1 || p < firstSpan)) firstSpan = p;
+  if (firstSpan === -1) return false;
+  if (src.indexOf('*', firstSpan) === -1 && src.indexOf('_', firstSpan) === -1 &&
+      src.indexOf('~', firstSpan) === -1) return false;
   let i = 0;
   while (i < n) {
     // Next span-start char among \ ` [ < (native indexOf jumps).
     let next = -1;
-    for (const ch of '\\`[<') {
-      const p = src.indexOf(ch, i);
-      if (p !== -1 && (next === -1 || p < next)) next = p;
-    }
+    p = src.indexOf('\\', i);
+    if (p !== -1) next = p;
+    p = src.indexOf('`', i);
+    if (p !== -1 && (next === -1 || p < next)) next = p;
+    p = src.indexOf('[', i);
+    if (p !== -1 && (next === -1 || p < next)) next = p;
+    p = src.indexOf('<', i);
+    if (p !== -1 && (next === -1 || p < next)) next = p;
     if (next === -1) return false;
     i = next;
     const c = src.charCodeAt(i);
