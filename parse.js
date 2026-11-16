@@ -1438,10 +1438,14 @@ function fastInlineTokens(lexer, src, maskedSrc, tokens) {
       i = tz.del(e, maskedSrc, r);
       if (i) { e = e.substring(i.raw.length); n.push(i); continue; }
     }
-    // url (only outside a link), then the text fallback.
-    if (!lexer.state.inLink && (i = tz.url(e))) {
-      e = e.substring(i.raw.length); n.push(i); continue;
-    }
+    // Text fallback. Try the fast text run first: when the segment
+    // up to the next trigger char holds no url/email fallback
+    // substring (://, www., @, mailto:, xmpp:, '  \n'), the url
+    // regex cannot match at this position (every url/email form
+    // needs one of them), so skip the url exec entirely. When
+    // fastTextRun returns null, fall through to url, then to the
+    // original inlineText regex (called directly to avoid a second
+    // fastTextRun inside the override).
     let l = e;
     if (extStartInline) {
       let p = Infinity;
@@ -1452,8 +1456,22 @@ function fastInlineTokens(lexer, src, maskedSrc, tokens) {
         if (typeof u === 'number' && u >= 0) p = Math.min(p, u);
       });
       if (p < Infinity && p >= 0) l = e.substring(0, p + 1);
+    } else {
+      const fast = fastTextRun(l, lexer.state.inRawBlock);
+      if (fast) {
+        e = e.substring(fast.raw.length);
+        if (fast.raw.slice(-1) !== '_') r = fast.raw.slice(-1);
+        s = true;
+        const p = n[n.length - 1];
+        if (p?.type === 'text') { p.raw += fast.raw; p.text += fast.text; }
+        else n.push(fast);
+        continue;
+      }
     }
-    if (i = tz.inlineText(l)) {
+    if (!lexer.state.inLink && (i = tz.url(e))) {
+      e = e.substring(i.raw.length); n.push(i); continue;
+    }
+    if (i = (extStartInline ? tz.inlineText(l) : _inlineTextOriginal.call(tz, l))) {
       e = e.substring(i.raw.length);
       if (i.raw.slice(-1) !== '_') r = i.raw.slice(-1);
       s = true;
