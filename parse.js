@@ -586,17 +586,20 @@ function emUndFast(tok, e, maskedSrc, prevChar) {
   if (prev >= 128) return null;
   if (isAsciiPunctNoTilde(f) && prevChar !== ''
     && !isAsciiSpace(prev) && !isAsciiPunct(prev)) return false; // d/n/u gate
-  // Opener flanking (start of string counts as whitespace). When the
-  // opener cannot open, the original finds no token either -- but the
-  // opener rule is subtle (it is enforced by the gate plus the closer
-  // search, not by a single check), so bail to the original instead
-  // of claiming "no token" here.
+  // Opener flanking (start of string counts as whitespace). The
+  // opener can open iff left-flanking AND (not right-flanking OR
+  // preceded by punctuation) -- exactly the CommonMark rule the
+  // original enforces for '_'. When it cannot open, the original
+  // finds no token starting at this '_' either (it does not skip
+  // ahead to a later '_'; the loop advances past this one as text),
+  // so return false (proven no token) instead of falling back to
+  // the original's big regex.
   const prevIsSpace = prev === -1 || isAsciiSpace(prev);
   const prevIsPunct = prev !== -1 && isAsciiPunct(prev);
   const fIsPunct = isAsciiPunct(f);
   const lfOp = !fIsPunct || prevIsSpace || prevIsPunct;
   const rfOp = !prevIsSpace && (!prevIsPunct || fIsPunct);
-  if (!lfOp || (rfOp && !prevIsPunct)) return null; // cannot open: bail
+  if (!lfOp || (rfOp && !prevIsPunct)) return false; // cannot open: no token
   // Closer: first later '_' run of exactly length k in the MASKED
   // string (indices align with the original).
   const mClose = maskedSrc.indexOf('_', pos + k);
@@ -680,8 +683,21 @@ function delFast(tok, e, maskedSrc, prevChar) {
   if (n <= k + 1) return null;
   const f = e.charCodeAt(k);
   if (f >= 128 || isAsciiSpace(f)) return null;
-  if (isAsciiPunctNoTilde(f) && prevChar !== '' && !isAsciiPunct(prevChar)) return false; // gate
   const pos = maskedSrc.length - e.length;
+  const prev = pos > 0 ? maskedSrc.charCodeAt(pos - 1) : -1;
+  // d/n/u gate (mirrors the original del): the opener is followed by
+  // punctuation (ye, no '~') and a preceding char exists that the
+  // original's `punctuation` (nt = [\s\p{P}\p{S}] except '*'/'_')
+  // does not match -- i.e. a word char, '*' or '_'. A preceding
+  // space does NOT block (nt includes \s). The old code called
+  // isAsciiPunct(prevChar) with the string param, which always
+  // returned false (NaN coercion), so it wrongly blocked on any
+  // preceding char (e.g. 'x ~~?a~~ y' lost its del).
+  if (isAsciiPunctNoTilde(f) && prevChar !== '') {
+    if (prev >= 128) return null; // non-ASCII prev: cannot classify, bail
+    if (prev === 42 || prev === 95) return false; // '*'/'_': nt excludes them
+    if (!isAsciiSpace(prev) && !isAsciiPunct(prev)) return false; // word char
+  }
   const mClose = maskedSrc.indexOf('~~', pos + k);
   if (mClose < 0) return false; // no closer run: definitely no token
   const cpos = mClose - pos;
