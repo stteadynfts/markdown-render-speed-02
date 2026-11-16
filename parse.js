@@ -432,8 +432,110 @@ _.prototype.reflink = function (src, links) {
 const _emStrongOriginal = _.prototype.emStrong;
 _.prototype.emStrong = function (src, maskedSrc, prevChar) {
   const c = src.charCodeAt(0);
-  return (c === 42 || c === 95) ? _emStrongOriginal.call(this, src, maskedSrc, prevChar) : undefined;
+  if (c !== 42 && c !== 95) return undefined;
+  // v6 step 8: fast path for single/double '*' emphasis with plain
+  // neighbours (see emStrongFast below). Anything else, including all
+  // '_' emphasis, falls through to the original.
+  if (c === 42) {
+    const fast = emStrongFast(this, src, maskedSrc, prevChar);
+    if (fast) return fast;
+  }
+  return _emStrongOriginal.call(this, src, maskedSrc, prevChar);
 };
+
+// ASCII whitespace (space, tab, LF, CR, VT, FF) and punctuation
+// (33-47, 58-64, 91-96, 123-126) code checks. Non-ASCII neighbours
+// bail to the original (Unicode punctuation/space classes).
+function isAsciiSpace(c) {
+  return c === 32 || c === 9 || c === 10 || c === 13 || c === 11 || c === 12;
+}
+function isAsciiPunct(c) {
+  return (c >= 33 && c <= 47) || (c >= 58 && c <= 64) ||
+    (c >= 91 && c <= 96) || (c >= 123 && c <= 126);
+}
+
+// Fast path for `*text*` (em) and `**text**` (strong): the opener run
+// is exactly 1 or 2 asterisks, the closer is the first later run of
+// exactly the same length, both are valid delimiters, and every
+// neighbour char is ASCII. Returns the token, or null to fall back to
+// the original emStrong. The reasoning mirrors the original's first
+// loop iteration for these shapes:
+//   - the opener is not preceded by '*'/'_' (so the preceding delimiter
+//     run is empty, y = k, and the rule of 3 can never block a k/k
+//     pair: (k+k)%3 is 2 for k=1 and 1 for k=2);
+//   - the 'o' flag (prevChar === '*') cannot be set when the preceding
+//     char is not '*', so the loop's break never triggers;
+//   - the closer is right-flanking (checked below), so the loop's
+//     opener-only skip never triggers, and whether it can also open
+//     does not block the match for a k/k pair;
+//   - the d/n/u gate is replicated: when the opener is followed by
+//     punctuation and a preceding char exists that is neither
+//     punctuation nor whitespace, the original returns nothing, so
+//     this bails instead.
+// The content may hold any other inline markup; it is tokenized by
+// the full inlineTokens machinery, exactly as the original does.
+function emStrongFast(tok, e, maskedSrc, prevChar) {
+  const n = e.length;
+  // Opener run: exactly 1 or 2 '*'.
+  let k = 1;
+  if (e.charCodeAt(1) === 42) {
+    if (e.charCodeAt(2) === 42) return null; // run of 3+: bail
+    k = 2;
+  }
+  if (n <= k + 1) return null;
+  // Char after the opener: ASCII, not whitespace (else LDelim has no
+  // following-char group and the original returns nothing).
+  const f = e.charCodeAt(k);
+  if (f >= 128 || isAsciiSpace(f)) return null;
+  const d = isAsciiPunct(f); // opener followed by punctuation
+  // Char before the opener in the masked run: ASCII (or start of run),
+  // and not '*'/'_' (else the preceding delimiter run is non-empty).
+  const pos = maskedSrc.length - e.length;
+  const prev = pos > 0 ? maskedSrc.charCodeAt(pos - 1) : -1;
+  if (prev >= 128 || prev === 42 || prev === 95) return null;
+  // prevChar param: when non-empty it equals the char before the
+  // opener (the previous token was text); when empty there is no
+  // preceding text char. Non-ASCII bails.
+  if (prevChar !== '') {
+    if (prevChar.length !== 1 || prevChar.charCodeAt(0) >= 128) return null;
+  }
+  // d/n/u gate: opener followed by punctuation, a preceding char
+  // exists, and it is neither punctuation nor whitespace.
+  if (d && prevChar !== '') {
+    const u = isAsciiSpace(prev) || isAsciiPunct(prev);
+    if (!u) return null;
+  }
+  // Closer: first later '*' run of exactly length k in the MASKED
+  // string (a '*' inside a code/link/html span is hidden there, so
+  // the original's closer scan never sees it). Indices align with
+  // the original (the mask preserves length), so raw/text are sliced
+  // from e at the same positions.
+  const mClose = maskedSrc.indexOf('*', pos + k);
+  if (mClose < 0) return null;
+  const cpos = mClose - pos; // closer index within e
+  if (cpos === k) return null; // empty content
+  for (let j = 0; j < k; j++) {
+    if (maskedSrc.charCodeAt(mClose + j) !== 42) return null;
+  }
+  if (maskedSrc.charCodeAt(mClose + k) === 42) return null; // longer run: bail
+  // Closer must be right-flanking (checked on the masked string, as
+  // the original's closer scan does): not preceded by whitespace, and
+  // (not preceded by punctuation, or followed by whitespace /
+  // punctuation / end of string).
+  const before = maskedSrc.charCodeAt(mClose - 1);
+  if (before >= 128 || isAsciiSpace(before)) return null;
+  const after = mClose + k < maskedSrc.length ? maskedSrc.charCodeAt(mClose + k) : -1;
+  if (after !== -1 && after >= 128) return null;
+  if (isAsciiPunct(before) && after !== -1 && !isAsciiSpace(after) && !isAsciiPunct(after)) return null;
+  const raw = e.slice(0, cpos + k);
+  const text = e.slice(k, cpos);
+  return {
+    type: k === 1 ? 'em' : 'strong',
+    raw,
+    text,
+    tokens: tok.lexer.inlineTokens(text),
+  };
+}
 
 const _codespanOriginal = _.prototype.codespan;
 _.prototype.codespan = function (src) {
