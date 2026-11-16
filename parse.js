@@ -1542,3 +1542,49 @@ _.prototype.paragraph = function (src) {
   const text = src.slice(0, end);
   return { type: 'paragraph', raw: text, text, tokens: this.lexer.inline(text) };
 };
+
+// ---------------------------------------------------------------------------
+// v6 step 7: renderer fusion for Parser.parseInline. When the default HTML
+// renderer is used and no custom renderers exist, the per-token method
+// calls for the common inline types are inlined: text/escape (with the
+// tokens/escaped branches of Renderer.text), html, codespan, br, em,
+// strong, del and checkbox. link/image still go through the renderer
+// methods (they need the he()/P() juggling). The textRenderer case and
+// any custom renderers fall back to the original method unchanged.
+// ---------------------------------------------------------------------------
+
+const _parseInlineOriginal = w.prototype.parseInline;
+w.prototype.parseInline = function (e, t = this.renderer) {
+  if (t !== this.renderer || this.options.extensions?.renderers) {
+    return _parseInlineOriginal.call(this, e, t);
+  }
+  this.renderer.parser = this;
+  let n = '';
+  for (let s = 0; s < e.length; s++) {
+    const o = e[s];
+    switch (o.type) {
+      case 'text':
+      case 'escape': {
+        if (o.tokens) n += this.parseInline(o.tokens);
+        else if (o.escaped) n += o.text;
+        else n += P(o.text);
+        break;
+      }
+      case 'html': { n += o.text; break; }
+      case 'codespan': { n += '<code>' + P(o.text, true) + '</code>'; break; }
+      case 'br': { n += '<br>'; break; }
+      case 'em': { n += '<em>' + this.parseInline(o.tokens) + '</em>'; break; }
+      case 'strong': { n += '<strong>' + this.parseInline(o.tokens) + '</strong>'; break; }
+      case 'del': { n += '<del>' + this.parseInline(o.tokens) + '</del>'; break; }
+      case 'checkbox': { n += '<input ' + (o.checked ? 'checked="" ' : '') + 'disabled="" type="checkbox"> '; break; }
+      case 'link': { n += t.link(o); break; }
+      case 'image': { n += t.image(o); break; }
+      default: {
+        const i = 'Token with "' + o.type + '" type was not found.';
+        if (this.options.silent) { console.error(i); return ''; }
+        throw new Error(i);
+      }
+    }
+  }
+  return n;
+};
