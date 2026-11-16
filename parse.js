@@ -1323,7 +1323,11 @@ O.prototype.inlineTokens = function (src, tokens = []) {
     // is skipped when maskNeeded() proves no delimiter sits inside a
     // masked span or is escaped (then maskedSrc === src behaves
     // identically for emStrong/del -- see step 4 note above).
-    const masked = HAS_MASK_CHARS.test(src) && maskNeeded(src) ? maskSrcOriginal(this, src) : src;
+    // HAS_MASK_CHARS.exec also yields the first span-start index,
+    // which maskNeeded would otherwise find with 4 indexOf calls.
+    const maskMatch = HAS_MASK_CHARS.exec(src);
+    const masked = maskMatch && maskNeeded(src, maskMatch.index)
+      ? maskSrcOriginal(this, src) : src;
     Ae(this.tokenizer, masked);
     try {
       return fastInlineTokens(this, src, masked, tokens);
@@ -1582,18 +1586,9 @@ function linkSpanEnd(src, pos) {
 // inside a span if some delimiter occurs at or after the first
 // span-start char (a delimiter before every span-start sits outside
 // all spans, since spans begin at span-start chars).
-function maskNeeded(src) {
+function maskNeeded(src, firstSpan) {
   const n = src.length;
-  let firstSpan = -1;
-  let p = src.indexOf('\\', 0);
-  if (p !== -1) firstSpan = p;
-  p = src.indexOf('`', 0);
-  if (p !== -1 && (firstSpan === -1 || p < firstSpan)) firstSpan = p;
-  p = src.indexOf('[', 0);
-  if (p !== -1 && (firstSpan === -1 || p < firstSpan)) firstSpan = p;
-  p = src.indexOf('<', 0);
-  if (p !== -1 && (firstSpan === -1 || p < firstSpan)) firstSpan = p;
-  if (firstSpan === -1) return false;
+  let p;
   if (src.indexOf('*', firstSpan) === -1 && src.indexOf('_', firstSpan) === -1 &&
       src.indexOf('~', firstSpan) === -1) return false;
   let i = 0;
