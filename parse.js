@@ -154,7 +154,8 @@ function fastTextRun(src, inRawBlock) {
   // (2.3x faster), 100% agreement. TEXT_FALLBACK has no /g flag, so
   // .test() is stateless here.
   if (TEXT_FALLBACK.test(seg)) return null;
-  return { type: 'text', raw: seg, text: inRawBlock ? seg : Ie(seg), escaped: inRawBlock };
+  // Ie() only rewrites numeric character references, which need '&#'.
+  return { type: 'text', raw: seg, text: inRawBlock || !seg.includes('&#') ? seg : Ie(seg), escaped: inRawBlock };
 }
 
 const _inlineTextOriginal = _.prototype.inlineText;
@@ -802,17 +803,29 @@ const HAS_MASK_CHARS = /[`\\[<]/;
 function maskSrcOriginal(lexer, e) {
   let t = e;
   if (lexer.tokens.links && e.includes('[')) {
-    const n = lexer.tokenizer.rules.inline.reflinkSearch;
-    const s = (r) => {
-      const o = r.lastIndexOf('[');
-      if (!Object.hasOwn(lexer.tokens.links, F(r.slice(o + 1, -1)))) return r;
-      if (o > 1 && r.charAt(0) !== '!') {
-        const i = r.slice(1, o - 1);
-        if (lexer.linkInText(i)) return '[' + i.replace(n, s) + '][' + 'a'.repeat(r.length - o - 2) + ']';
-      }
-      return '[' + 'a'.repeat(r.length - 2) + ']';
-    };
-    t = t.replace(n, s);
+    // reflinkSearch can only match where a ']' is followed by '['
+    // (reflink) or by anything but '(' (nolink, incl. end of string).
+    // When every ']' is followed by '(', the replace is an identity
+    // scan over the whole run -- skip it (badge links are all [...](...)).
+    let maybe = false;
+    let idx = e.indexOf(']');
+    while (idx !== -1) {
+      if (e.charCodeAt(idx + 1) !== 40) { maybe = true; break; }
+      idx = e.indexOf(']', idx + 1);
+    }
+    if (maybe) {
+      const n = lexer.tokenizer.rules.inline.reflinkSearch;
+      const s = (r) => {
+        const o = r.lastIndexOf('[');
+        if (!Object.hasOwn(lexer.tokens.links, F(r.slice(o + 1, -1)))) return r;
+        if (o > 1 && r.charAt(0) !== '!') {
+          const i = r.slice(1, o - 1);
+          if (lexer.linkInText(i)) return '[' + i.replace(n, s) + '][' + 'a'.repeat(r.length - o - 2) + ']';
+        }
+        return '[' + 'a'.repeat(r.length - 2) + ']';
+      };
+      t = t.replace(n, s);
+    }
   }
   // Each replace below is a no-op unless its trigger character is
   // present: anyPunctuationOutsideCode only matches backtick runs or
@@ -821,7 +834,7 @@ function maskSrcOriginal(lexer, e) {
   if (e.includes('`') || e.includes('\\')) {
     t = t.replace(lexer.tokenizer.rules.inline.anyPunctuationOutsideCode, (n, s, r) => r ? '+'.repeat(n.length) : s ? s + n.slice(s.length, -s.length).replace(/`/g, '+') + s : n);
   }
-  if (e.includes('[') || e.includes('`') || e.includes('<')) {
+  if ((e.includes('[') && e.includes(']')) || e.includes('`') || e.includes('<')) {
     t = t.replace(lexer.tokenizer.rules.inline.blockSkip, (n, s, r) => { const o = r ? r.length : 0; return n.slice(0, o) + '[' + 'a'.repeat(n.length - o - 2) + ']'; });
   }
   return lexer.options.hooks?.emStrongMask?.call({ lexer }, t) ?? t;
