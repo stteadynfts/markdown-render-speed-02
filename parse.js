@@ -607,7 +607,13 @@ function emUndFast(tok, e, maskedSrc, prevChar) {
     if (maskedSrc.charCodeAt(mClose + j) !== 95) return null;
   }
   if (maskedSrc.charCodeAt(mClose + k) === 95) return null; // longer run: bail
-  if (maskedSrc.indexOf('**', pos + k) < mClose) return null; // '**' in content
+  // The closer regex has a skip alternative for '**..._...**'
+  // regions (^[^_*]*?\*\*[^_*]*?_[^_*]*?(?=\*\*)): it only matters
+  // when a '**' before the closer, the closer '_' itself, and a
+  // later '**' form that pattern with no '*'/'_' between them (the
+  // closer is then skipped and a later '_' is used). Bail only then;
+  // a '**' elsewhere in the content does not affect the closer.
+  if (undSkipPattern(maskedSrc, pos + k, mClose)) return null;
   // Closer flanking (end of string counts as whitespace).
   const before = maskedSrc.charCodeAt(mClose - 1);
   if (before >= 128 || isAsciiSpace(before)) return null;
@@ -627,6 +633,27 @@ function emUndFast(tok, e, maskedSrc, prevChar) {
     text,
     tokens: tok.lexer.inlineTokens(text),
   };
+}
+
+// True when the RDelimUnd skip alternative (^[^_*]*?\*\*[^_*]*?_
+// [^_*]*?(?=\*\*)) matches a prefix of s[a..] that contains the '_'
+// at b, so the closer at b is skipped by the original and a later
+// '_' is used. Only then must the '_' fast path bail. A '**' that
+// does not form that exact pattern (a lone '*' before it, a '*'
+// between it and the closer, no later '**', a '_' or lone '*' before
+// the later '**') does not affect the closer.
+function undSkipPattern(s, a, b) {
+  const q1 = s.indexOf('**', a);
+  if (q1 === -1 || q1 >= b) return false; // no '**' before the closer
+  if (s.indexOf('*', a) !== q1) return false; // a lone '*' before it
+  const starAfter = s.indexOf('*', q1 + 2);
+  if (starAfter !== -1 && starAfter < b) return false; // '*' between '**' and closer
+  const q3 = s.indexOf('**', b + 1);
+  if (q3 === -1) return false; // no later '**'
+  const undAfter = s.indexOf('_', b + 1);
+  if (undAfter !== -1 && undAfter < q3) return false; // '_' between closer and '**'
+  if (s.indexOf('*', b + 1) !== q3) return false; // a lone '*' before the later '**'
+  return true;
 }
 
 // Fast path for '~~text~~' (del, k=2) and '~text~' (del, k=1).
